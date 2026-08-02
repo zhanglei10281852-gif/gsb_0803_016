@@ -3,7 +3,7 @@ import type { Database as DatabaseType } from 'better-sqlite3';
 import { mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
 
-const SCHEMA_VERSION = 1;
+const SCHEMA_VERSION = 2;
 
 const SCHEMA_SQL = `
 CREATE TABLE IF NOT EXISTS schema_meta (
@@ -33,13 +33,14 @@ CREATE TABLE IF NOT EXISTS incoming_events (
 );
 
 CREATE TABLE IF NOT EXISTS fragments (
-  session_id  TEXT NOT NULL,
-  source_id   TEXT NOT NULL,
-  source_seq  INTEGER NOT NULL,
-  event_type  TEXT NOT NULL,
-  content     TEXT NOT NULL,
-  event_id    TEXT NOT NULL,
-  updated_at  INTEGER NOT NULL,
+  session_id   TEXT NOT NULL,
+  source_id    TEXT NOT NULL,
+  source_seq   INTEGER NOT NULL,
+  event_type   TEXT NOT NULL,
+  content      TEXT NOT NULL,
+  event_id     TEXT NOT NULL,
+  is_corrected INTEGER NOT NULL DEFAULT 0,
+  updated_at   INTEGER NOT NULL,
   PRIMARY KEY (session_id, source_id, source_seq),
   FOREIGN KEY (session_id) REFERENCES sessions(session_id)
 );
@@ -54,6 +55,8 @@ CREATE TABLE IF NOT EXISTS revisions (
   content       TEXT NOT NULL,
   snapshot_text TEXT NOT NULL,
   summary       TEXT NOT NULL,
+  correction_id TEXT,
+  metadata      TEXT,
   created_at    INTEGER NOT NULL,
   PRIMARY KEY (session_id, revision),
   FOREIGN KEY (session_id) REFERENCES sessions(session_id)
@@ -68,6 +71,40 @@ CREATE TABLE IF NOT EXISTS consumer_cursors (
   FOREIGN KEY (session_id) REFERENCES sessions(session_id)
 );
 
+CREATE TABLE IF NOT EXISTS correction_leases (
+  session_id    TEXT NOT NULL,
+  source_id     TEXT NOT NULL,
+  source_seq    INTEGER NOT NULL,
+  lease_id      TEXT NOT NULL,
+  actor         TEXT NOT NULL,
+  base_revision INTEGER NOT NULL,
+  base_content  TEXT NOT NULL,
+  status        TEXT NOT NULL DEFAULT 'active',
+  acquired_at   INTEGER NOT NULL,
+  expires_at    INTEGER NOT NULL,
+  consumed_at   INTEGER,
+  PRIMARY KEY (session_id, source_id, source_seq),
+  UNIQUE (session_id, lease_id),
+  FOREIGN KEY (session_id) REFERENCES sessions(session_id)
+);
+
+CREATE TABLE IF NOT EXISTS corrections (
+  session_id                TEXT NOT NULL,
+  correction_id             TEXT NOT NULL,
+  lease_id                  TEXT NOT NULL,
+  source_id                 TEXT NOT NULL,
+  source_seq                INTEGER NOT NULL,
+  actor                     TEXT NOT NULL,
+  reason                    TEXT NOT NULL,
+  original_content          TEXT NOT NULL,
+  corrected_content         TEXT NOT NULL,
+  supersedes_correction_id  TEXT,
+  revision                  INTEGER NOT NULL,
+  created_at                INTEGER NOT NULL,
+  PRIMARY KEY (session_id, correction_id),
+  FOREIGN KEY (session_id) REFERENCES sessions(session_id)
+);
+
 CREATE INDEX IF NOT EXISTS idx_incoming_events_source
   ON incoming_events (session_id, source_id, source_seq);
 CREATE INDEX IF NOT EXISTS idx_fragments_lookup
@@ -76,7 +113,36 @@ CREATE INDEX IF NOT EXISTS idx_revisions_session
   ON revisions (session_id, revision);
 CREATE INDEX IF NOT EXISTS idx_cursors_consumer
   ON consumer_cursors (session_id, consumer_id);
+CREATE INDEX IF NOT EXISTS idx_corrections_fragment
+  ON corrections (session_id, source_id, source_seq);
+CREATE INDEX IF NOT EXISTS idx_leases_lease_id
+  ON correction_leases (session_id, lease_id);
 `;
+
+function addColumnIfMissing(
+  db: DatabaseType,
+  table: string,
+  column: string,
+  definition: string,
+): void {
+  const columns = db.prepare(`PRAGMA table_info(${table})`).all() as Array<{
+    name: string;
+  }>;
+  if (!columns.some((c) => c.name === column)) {
+    db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
+  }
+}
+
+function runMigrations(db: DatabaseType): void {
+  addColumnIfMissing(
+    db,
+    'fragments',
+    'is_corrected',
+    'INTEGER NOT NULL DEFAULT 0',
+  );
+  addColumnIfMissing(db, 'revisions', 'correction_id', 'TEXT');
+  addColumnIfMissing(db, 'revisions', 'metadata', 'TEXT');
+}
 
 export interface OpenDbResult {
   db: DatabaseType;
@@ -99,15 +165,11 @@ export function openDatabase(
   db.pragma(`busy_timeout = ${busyTimeoutMs}`);
 
   db.exec(SCHEMA_SQL);
+  runMigrations(db);
 
-  const versionRow = db
-    .prepare('SELECT value FROM schema_meta WHERE key = ?')
-    .get('version') as { value: string } | undefined;
-  if (!versionRow) {
-    db.prepare(
-      'INSERT OR IGNORE INTO schema_meta (key, value) VALUES (?, ?)',
-    ).run('version', String(SCHEMA_VERSION));
-  }
+  db.prepare(
+    `INSERT OR IGNORE INTO schema_meta (key, value) VALUES (?, ?)`,
+  ).run('version', String(SCHEMA_VERSION));
 
   const close = () => {
     try {

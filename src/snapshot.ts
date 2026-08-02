@@ -11,6 +11,7 @@ export function rowsToFragments(rows: FragmentRow[]): FragmentData[] {
     sourceSeq: r.source_seq,
     type: r.event_type,
     content: r.content,
+    corrected: r.is_corrected === 1,
   }));
 }
 
@@ -26,6 +27,7 @@ export function buildSummary(fragments: FragmentData[]): SessionSummary {
   const sourceIds = new Set<string>();
   let finalCount = 0;
   let partialCount = 0;
+  let correctedCount = 0;
   let textLength = 0;
   for (const f of fragments) {
     sourceIds.add(f.sourceId);
@@ -34,6 +36,9 @@ export function buildSummary(fragments: FragmentData[]): SessionSummary {
     } else {
       partialCount++;
     }
+    if (f.corrected) {
+      correctedCount++;
+    }
     textLength += f.content.length;
   }
   return {
@@ -41,6 +46,7 @@ export function buildSummary(fragments: FragmentData[]): SessionSummary {
     fragmentCount: fragments.length,
     finalCount,
     partialCount,
+    correctedCount,
     textLength,
   };
 }

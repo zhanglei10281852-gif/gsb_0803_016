@@ -70,6 +70,67 @@ for await (const batch of consumer.stream({ pollIntervalMs: 200 })) {
 store.close();
 ```
 
+## 人工复核：片段修订租约
+
+转写结果进入人工复核时，复核员必须先领取有时限的租约才能提交校正。竞争领取同一片段只有一个成功；过期或基于旧版本的提交以可区分的冲突错误结束。校正**不改写原始识别事件**，而是保留 actor、原因和 supersedes 谱系，并作为同一条耐久修订流中的新 revision 被现有消费者续读。
+
+```typescript
+const session = store.session('call-abc-123');
+
+// 1. 复核员基于看到的快照 revision 领取租约
+const lease = session.acquireLease({
+  sourceId: 'agent-mic',
+  sourceSeq: 1,
+  actor: 'reviewer-alice',
+  baseRevision: 5,        // 复核员看到的快照 revision
+  ttlMs: 60000,           // 租约时限，默认 60s
+});
+
+// 2. 提交校正
+const correction = session.submitCorrection({
+  leaseId: lease.leaseId,
+  correctedContent: '你好，世界',
+  reason: '同音字错误：世届 -> 世界',
+});
+// correction.revision 是新的修订号，correction.supersedesCorrectionId 形成谱系
+
+// 3. 现有消费者无需任何改动即可读到 correction-applied 修订
+const consumer = store.consumer('call-abc-123', 'qc-engine');
+const batch = consumer.read(100);
+for (const rev of batch) {
+  if (rev.changeType === 'correction-applied') {
+    console.log(rev.correction!.actor, rev.correction!.reason);
+    console.log(rev.snapshotText);  // 校正后的全文
+  }
+}
+```
+
+### 租约与校正 API
+
+- `session.acquireLease(options): Lease` — 领取租约。若同一 `(sourceId, sourceSeq)` 上存在未过期的活跃租约，抛出 `LeaseBusyError`；过期后可被新领取者替换。
+- `session.submitCorrection(options): Correction` — 基于租约提交校正。可能抛出：
+  - `LeaseNotFoundError` — 租约不存在或已释放
+  - `LeaseConsumedError` — 租约已被使用（一次性）
+  - `LeaseExpiredError` — 租约已过期（`code: 'LEASE_EXPIRED'`）
+  - `StaleBaseRevisionError` — 领取租约后片段内容发生了变化（`code: 'STALE_BASE_REVISION'`）
+- `session.releaseLease(leaseId): boolean` — 主动释放租约
+- `session.getLease(sourceId, sourceSeq): Lease | null` — 查询当前租约状态（读取时惰性过期）
+- `session.getCorrectionsForFragment(sourceId, sourceSeq): Correction[]` — 查询校正谱系
+
+校正提交后，该片段被标记为 `corrected`：
+- 迟到的 partial 被忽略
+- 不同 eventId 的 final 被拒绝（`SlotFinalizedError`），与 final 不回退规则一致
+
+### 错误码对照
+
+| 错误类 | `code` | 含义 |
+|--------|--------|------|
+| `LeaseBusyError` | `LEASE_BUSY` | 另一复核员持有活跃租约 |
+| `LeaseExpiredError` | `LEASE_EXPIRED` | 租约超过 TTL |
+| `LeaseConsumedError` | `LEASE_CONSUMED` | 租约已用于提交校正 |
+| `LeaseNotFoundError` | `LEASE_NOT_FOUND` | 租约不存在或已释放 |
+| `StaleBaseRevisionError` | `STALE_BASE_REVISION` | 租约期间片段内容被修改 |
+
 ## 核心 API
 
 ### `RecognitionStore.open(options)`
@@ -129,7 +190,7 @@ store.close();
 
 ### 持久性
 
-- 所有写操作（事件记录、片段状态、修订插入、游标确认）均在 `BEGIN IMMEDIATE` 事务中完成。
+- 所有写操作（事件记录、片段状态、修订插入、游标确认、租约领取/消耗、校正记录）均在 `BEGIN IMMEDIATE` 事务中完成。
 - SQLite 配置 `WAL` + `synchronous=FULL`，事务提交后落盘。
 - 进程被 `SIGKILL` 终止时，已提交事务完整保留，未提交事务完全回滚，不会出现只写一半的状态。
 - 多进程并发写同一数据库时，由 SQLite 写锁 + `busy_timeout` 串行化。
@@ -151,13 +212,13 @@ store.close();
 src/
   index.ts       公开 API 导出
   store.ts       RecognitionStore 入口
-  session.ts     事件摄入、快照、修订分配（核心事务）
+  session.ts     事件摄入、快照、修订分配、租约与校正事务
   consumer.ts    消费者游标、读取、确认、流式订阅
-  db.ts          SQLite 连接、pragma、schema
+  db.ts          SQLite 连接、pragma、schema 与迁移
   snapshot.ts    确定性快照/摘要构建
   hash.ts        事件内容指纹（冲突检测）
-  errors.ts      自定义错误类型
+  errors.ts      自定义错误类型（含租约冲突）
 test/
-  unit/          幂等、乱序、final 保护、修订、消费者
-  e2e/           多进程并发、SIGKILL 断电重开、慢消费者
+  unit/          幂等、乱序、final 保护、修订、消费者、校正租约
+  e2e/           多进程并发、SIGKILL 断电重开、慢消费者、校正流程
 ```

@@ -6,6 +6,11 @@ export {
   EventConflictError,
   SlotFinalizedError,
   StoreClosedError,
+  LeaseBusyError,
+  LeaseExpiredError,
+  LeaseConsumedError,
+  LeaseNotFoundError,
+  StaleBaseRevisionError,
 } from './errors';
 export type {
   IngestEvent,
@@ -18,5 +23,11 @@ export type {
   SessionSummary,
   Snapshot,
   RevisionData,
+  CorrectionMetadata,
   StoreOptions,
+  Lease,
+  LeaseStatus,
+  Correction,
+  AcquireLeaseOptions,
+  SubmitCorrectionOptions,
 } from './types';

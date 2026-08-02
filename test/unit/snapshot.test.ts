@@ -25,6 +25,7 @@ describe('snapshot', () => {
       fragmentCount: 0,
       finalCount: 0,
       partialCount: 0,
+      correctedCount: 0,
       textLength: 0,
     });
   });

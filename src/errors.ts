@@ -21,3 +21,43 @@ export class StoreClosedError extends Error {
     this.name = 'StoreClosedError';
   }
 }
+
+export class LeaseBusyError extends Error {
+  public readonly code = 'LEASE_BUSY';
+  constructor(message: string) {
+    super(message);
+    this.name = 'LeaseBusyError';
+  }
+}
+
+export class LeaseExpiredError extends Error {
+  public readonly code = 'LEASE_EXPIRED';
+  constructor(message: string) {
+    super(message);
+    this.name = 'LeaseExpiredError';
+  }
+}
+
+export class LeaseConsumedError extends Error {
+  public readonly code = 'LEASE_CONSUMED';
+  constructor(message: string) {
+    super(message);
+    this.name = 'LeaseConsumedError';
+  }
+}
+
+export class LeaseNotFoundError extends Error {
+  public readonly code = 'LEASE_NOT_FOUND';
+  constructor(message: string) {
+    super(message);
+    this.name = 'LeaseNotFoundError';
+  }
+}
+
+export class StaleBaseRevisionError extends Error {
+  public readonly code = 'STALE_BASE_REVISION';
+  constructor(message: string) {
+    super(message);
+    this.name = 'StaleBaseRevisionError';
+  }
+}

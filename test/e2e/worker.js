@@ -65,7 +65,14 @@ function run() {
         process.stdout.write(JSON.stringify({
           ok: true,
           cursor: consumer.getCursor(),
-          revisions: batch.map(r => ({ revision: r.revision, sourceId: r.sourceId, sourceSeq: r.sourceSeq, changeType: r.changeType })),
+          revisions: batch.map(r => ({
+            revision: r.revision,
+            sourceId: r.sourceId,
+            sourceSeq: r.sourceSeq,
+            changeType: r.changeType,
+            correctionId: r.correctionId,
+            actor: r.correction ? r.correction.actor : null,
+          })),
         }));
       } else if (cmd.action === 'consumer-ack') {
         const consumer = store.consumer(cmd.sessionId, cmd.consumerId);
@@ -77,6 +84,36 @@ function run() {
         const row = db.prepare('SELECT COUNT(*) AS c FROM revisions WHERE session_id = ?').get(cmd.sessionId);
         db.close();
         process.stdout.write(JSON.stringify({ ok: true, count: row.c, latest: session.getLatestRevisionNumber() }));
+      } else if (cmd.action === 'acquire-lease') {
+        const session = store.session(cmd.sessionId);
+        const lease = session.acquireLease({
+          sourceId: cmd.sourceId,
+          sourceSeq: cmd.sourceSeq,
+          actor: cmd.actor,
+          baseRevision: cmd.baseRevision,
+          ttlMs: cmd.ttlMs,
+        });
+        process.stdout.write(JSON.stringify({ ok: true, lease }));
+      } else if (cmd.action === 'submit-correction') {
+        const session = store.session(cmd.sessionId);
+        const correction = session.submitCorrection({
+          leaseId: cmd.leaseId,
+          correctedContent: cmd.correctedContent,
+          reason: cmd.reason,
+        });
+        process.stdout.write(JSON.stringify({ ok: true, correction }));
+      } else if (cmd.action === 'release-lease') {
+        const session = store.session(cmd.sessionId);
+        const released = session.releaseLease(cmd.leaseId);
+        process.stdout.write(JSON.stringify({ ok: true, released }));
+      } else if (cmd.action === 'get-lease') {
+        const session = store.session(cmd.sessionId);
+        const lease = session.getLease(cmd.sourceId, cmd.sourceSeq);
+        process.stdout.write(JSON.stringify({ ok: true, lease }));
+      } else if (cmd.action === 'get-corrections') {
+        const session = store.session(cmd.sessionId);
+        const corrections = session.getCorrectionsForFragment(cmd.sourceId, cmd.sourceSeq);
+        process.stdout.write(JSON.stringify({ ok: true, corrections }));
       } else {
         process.stdout.write(JSON.stringify({ ok: false, error: 'unknown action: ' + cmd.action }));
       }

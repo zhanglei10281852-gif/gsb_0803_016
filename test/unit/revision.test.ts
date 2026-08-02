@@ -90,6 +90,7 @@ describe('revision stream', () => {
       fragmentCount: 2,
       finalCount: 1,
       partialCount: 1,
+      correctedCount: 0,
       textLength: 6,
     });
   });
