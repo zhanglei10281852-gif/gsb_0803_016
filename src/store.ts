@@ -3,6 +3,12 @@ import { openDatabase } from './db';
 import { Session } from './session';
 import { Consumer } from './consumer';
 import { StoreClosedError } from './errors';
+import {
+  writeSessionArchive,
+  importSessionArchive,
+  type ExportResult,
+  type ImportResult,
+} from './archive';
 import type { StoreOptions } from './types';
 
 export class RecognitionStore {
@@ -37,6 +43,16 @@ export class RecognitionStore {
     if (!this.db) throw new StoreClosedError();
     const session = this.session(sessionId);
     return new Consumer(this.db, session, consumerId);
+  }
+
+  exportSession(sessionId: string, filePath: string): Promise<ExportResult> {
+    if (!this.db) throw new StoreClosedError();
+    return writeSessionArchive(this.db, sessionId, filePath);
+  }
+
+  importSession(archivePath: string): ImportResult {
+    if (!this.db) throw new StoreClosedError();
+    return importSessionArchive(this.db, archivePath);
   }
 
   close(): void {

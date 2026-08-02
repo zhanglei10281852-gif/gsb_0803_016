@@ -1,11 +1,13 @@
 const path = require('path');
+const fs = require('fs');
 const Database = require('better-sqlite3');
 const { RecognitionStore } = require(path.resolve(__dirname, '..', '..', 'dist', 'index.js'));
+const { parseArchiveBuffer } = require(path.resolve(__dirname, '..', '..', 'dist', 'archive.js'));
 
 function run() {
   let raw = '';
   process.stdin.on('data', (chunk) => { raw += chunk; });
-  process.stdin.on('end', () => {
+  process.stdin.on('end', async () => {
     const cmd = JSON.parse(raw);
 
     if (cmd.action === 'crash-mid-txn') {
@@ -34,6 +36,29 @@ function run() {
       for (let i = 0; i < cmd.events.length; i++) {
         session.ingest(cmd.events[i]);
       }
+      process.kill(process.pid, 'SIGKILL');
+      return;
+    }
+
+    if (cmd.action === 'import-archive-crash-midway') {
+      const initStore = RecognitionStore.open({ dbPath: cmd.dbPath, busyTimeoutMs: 30000 });
+      initStore.close();
+
+      const buf = fs.readFileSync(cmd.archivePath);
+      const parsed = parseArchiveBuffer(buf);
+
+      const db = new Database(cmd.dbPath);
+      db.pragma('journal_mode = WAL');
+      db.pragma('synchronous = FULL');
+      db.pragma('busy_timeout = 30000');
+      db.pragma('foreign_keys = ON');
+      db.exec('BEGIN IMMEDIATE');
+
+      insertRaw(db, 'sessions', parsed.sessionRow);
+      for (const row of parsed.events.slice(0, Math.max(1, Math.floor(parsed.events.length / 2)))) {
+        insertRaw(db, 'incoming_events', row);
+      }
+
       process.kill(process.pid, 'SIGKILL');
       return;
     }
@@ -114,6 +139,23 @@ function run() {
         const session = store.session(cmd.sessionId);
         const corrections = session.getCorrectionsForFragment(cmd.sourceId, cmd.sourceSeq);
         process.stdout.write(JSON.stringify({ ok: true, corrections }));
+      } else if (cmd.action === 'export-archive') {
+        const result = await store.exportSession(cmd.sessionId, cmd.archivePath);
+        process.stdout.write(JSON.stringify({ ok: true, result }));
+      } else if (cmd.action === 'import-archive') {
+        const result = store.importSession(cmd.archivePath);
+        const session = store.session(result.sessionId);
+        const snap = session.getSnapshot();
+        process.stdout.write(JSON.stringify({
+          ok: true,
+          result,
+          snapshot: { text: snap.text, revision: snap.revision },
+        }));
+      } else if (cmd.action === 'session-exists') {
+        const db = new Database(cmd.dbPath, { readonly: true });
+        const row = db.prepare('SELECT session_id FROM sessions WHERE session_id = ?').get(cmd.sessionId);
+        db.close();
+        process.stdout.write(JSON.stringify({ ok: true, exists: !!row }));
       } else {
         process.stdout.write(JSON.stringify({ ok: false, error: 'unknown action: ' + cmd.action }));
       }
@@ -123,6 +165,13 @@ function run() {
       try { store.close(); } catch {}
     }
   });
+}
+
+function insertRaw(db, table, row) {
+  const keys = Object.keys(row);
+  const placeholders = keys.map(() => '?').join(', ');
+  db.prepare(`INSERT OR IGNORE INTO ${table} (${keys.join(', ')}) VALUES (${placeholders})`)
+    .run(...keys.map(k => row[k]));
 }
 
 run();

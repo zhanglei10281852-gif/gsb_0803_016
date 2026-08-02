@@ -11,6 +11,10 @@ export {
   LeaseConsumedError,
   LeaseNotFoundError,
   StaleBaseRevisionError,
+  ArchiveFormatError,
+  ArchiveChecksumError,
+  ArchiveVersionError,
+  SessionExistsError,
 } from './errors';
 export type {
   IngestEvent,
@@ -31,3 +35,8 @@ export type {
   AcquireLeaseOptions,
   SubmitCorrectionOptions,
 } from './types';
+export type {
+  ArchiveCounts,
+  ExportResult,
+  ImportResult,
+} from './archive';

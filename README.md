@@ -131,6 +131,64 @@ for (const rev of batch) {
 | `LeaseNotFoundError` | `LEASE_NOT_FOUND` | 租约不存在或已释放 |
 | `StaleBaseRevisionError` | `STALE_BASE_REVISION` | 租约期间片段内容被修改 |
 
+## 会话归档：自包含交接
+
+合规团队可将完整会话导出为自包含归档文件，交接至隔离环境。归档携带版本号、SHA-256 校验和、当前快照、完整修订历史、校正谱系（actor、baseRevision、原因、supersedes）和所有消费者游标位置。
+
+```typescript
+// 导出
+await store.exportSession('call-abc-123', '/transfer/call-abc-123.asra');
+
+// 在隔离环境导入
+const result = isolatedStore.importSession('/transfer/call-abc-123.asra');
+console.log(result.idempotent);  // 重复导入返回 true
+
+// 导入后快照、修订历史、消费者游标与导出端等价
+const snap = isolatedStore.session('call-abc-123').getSnapshot();
+const consumer = isolatedStore.consumer('call-abc-123', 'qc-engine');
+// consumer.getCursor() 与导出端一致，可直接续读
+```
+
+### 归档格式
+
+二进制长度前缀段格式，便于流式生成和顺序读取：
+
+```
+ASRA (4B magic) | version (uint32 LE) | segments... | checksum trailer
+```
+
+每个段为 `type(1B) | length(uint32 LE) | JSON payload`。段类型：
+
+| 类型 | 内容 |
+|------|------|
+| `H` | 头部：sessionId、导出时间、格式版本、各表行数 |
+| `S` | 会话元数据行 |
+| `E` | incoming_events（原始识别事件，不改写） |
+| `F` | fragments（当前片段状态） |
+| `R` | revisions（完整修订流） |
+| `C` | corrections（校正记录，含 actor/reason/supersedes 谱系） |
+| `L` | correction_leases（租约历史） |
+| `U` | consumer_cursors（所有消费者续读位置） |
+| `X` | 尾部校验段：前述全部字节的 SHA-256 + 行数校验 |
+
+### 安全保证
+
+- **篡改检测**：任何字节修改都会导致 SHA-256 不匹配，抛出 `ArchiveChecksumError`。
+- **截断检测**：长度前缀声明与实际可用字节不符，或缺少尾部校验段，抛出 `ArchiveFormatError`。
+- **计数校验**：头部和尾部双重记录的行数与实际段数逐一比对。
+- **原子导入**：归档先完整解析和校验（在校验通过前不写任何数据），通过后在单个 `BEGIN IMMEDIATE` 事务中写入全部表。校验失败或进程中途被 kill 不会留下半导入会话。
+- **幂等导入**：同一归档重复导入时，检测到会话已存在且内容一致则返回 `idempotent: true`；若目标会话存在但内容不同则抛出 `SessionExistsError`。
+- **版本兼容**：格式版本高于当前支持版本时抛出 `ArchiveVersionError`；未知段类型被保留不丢弃，JSON 中未知字段自然透传，为后续版本预留空间。
+
+### 错误码
+
+| 错误类 | `code` | 含义 |
+|--------|--------|------|
+| `ArchiveFormatError` | `ARCHIVE_FORMAT` | 魔数错误、段截断、计数不匹配、缺少头部/尾部 |
+| `ArchiveChecksumError` | `ARCHIVE_CHECKSUM` | SHA-256 校验失败（内容被篡改） |
+| `ArchiveVersionError` | `ARCHIVE_VERSION` | 归档格式版本高于当前支持版本 |
+| `SessionExistsError` | `SESSION_EXISTS` | 目标会话已存在且内容与归档不同 |
+
 ## 核心 API
 
 ### `RecognitionStore.open(options)`
@@ -211,14 +269,15 @@ for (const rev of batch) {
 ```
 src/
   index.ts       公开 API 导出
-  store.ts       RecognitionStore 入口
+  store.ts       RecognitionStore 入口（含 exportSession/importSession）
   session.ts     事件摄入、快照、修订分配、租约与校正事务
   consumer.ts    消费者游标、读取、确认、流式订阅
+  archive.ts     自包含归档格式、流式导出、校验与原子导入
   db.ts          SQLite 连接、pragma、schema 与迁移
   snapshot.ts    确定性快照/摘要构建
   hash.ts        事件内容指纹（冲突检测）
-  errors.ts      自定义错误类型（含租约冲突）
+  errors.ts      自定义错误类型（含租约、归档冲突）
 test/
-  unit/          幂等、乱序、final 保护、修订、消费者、校正租约
-  e2e/           多进程并发、SIGKILL 断电重开、慢消费者、校正流程
+  unit/          幂等、乱序、final 保护、修订、消费者、校正租约、归档
+  e2e/           多进程并发、SIGKILL 断电重开、慢消费者、校正流程、归档故障注入
 ```

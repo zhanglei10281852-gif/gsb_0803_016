@@ -61,3 +61,35 @@ export class StaleBaseRevisionError extends Error {
     this.name = 'StaleBaseRevisionError';
   }
 }
+
+export class ArchiveFormatError extends Error {
+  public readonly code = 'ARCHIVE_FORMAT';
+  constructor(message: string) {
+    super(message);
+    this.name = 'ArchiveFormatError';
+  }
+}
+
+export class ArchiveChecksumError extends Error {
+  public readonly code = 'ARCHIVE_CHECKSUM';
+  constructor(message: string) {
+    super(message);
+    this.name = 'ArchiveChecksumError';
+  }
+}
+
+export class ArchiveVersionError extends Error {
+  public readonly code = 'ARCHIVE_VERSION';
+  constructor(message: string) {
+    super(message);
+    this.name = 'ArchiveVersionError';
+  }
+}
+
+export class SessionExistsError extends Error {
+  public readonly code = 'SESSION_EXISTS';
+  constructor(message: string) {
+    super(message);
+    this.name = 'SessionExistsError';
+  }
+}
