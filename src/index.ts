@@ -1,0 +1,22 @@
+export { RecognitionStore } from './store';
+export { Session } from './session';
+export { Consumer } from './consumer';
+export type { StreamOptions } from './consumer';
+export {
+  EventConflictError,
+  SlotFinalizedError,
+  StoreClosedError,
+} from './errors';
+export type {
+  IngestEvent,
+  IngestResult,
+  IngestStatus,
+  EventType,
+  ChangeType,
+  FragmentData,
+  SourceSnapshot,
+  SessionSummary,
+  Snapshot,
+  RevisionData,
+  StoreOptions,
+} from './types';
