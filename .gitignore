@@ -1,0 +1,9 @@
+node_modules/
+dist/
+build/
+*.log
+*.sqlite
+*.sqlite-*
+.tmp/
+tmp/
+coverage/
