@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import type { AsrEvent, Segment, Snapshot } from './types';
+import type { AsrEvent, CorrectionInfo, Segment, Snapshot } from './types';
 
 /** Content fingerprint used to distinguish duplicates from conflicts. */
 export function eventHash(e: Pick<AsrEvent, 'kind' | 'text' | 'startMs'>): string {
@@ -19,6 +19,11 @@ export interface EventRow {
 }
 
 const NO_START = Number.MAX_SAFE_INTEGER;
+
+/** Key for per-segment correction lookups (unit separator avoids collisions). */
+export function correctionKey(sourceId: string, eventId: string): string {
+  return sourceId + '\u001f' + eventId;
+}
 
 /**
  * Deterministic, arrival-order-independent ordering for final segments:
@@ -42,8 +47,8 @@ export function comparePartials(a: EventRow, b: EventRow): number {
   return a.event_id < b.event_id ? -1 : 1;
 }
 
-function toSegment(r: EventRow): Segment {
-  return {
+function toSegment(r: EventRow, corrections?: Map<string, CorrectionInfo>): Segment {
+  const base: Segment = {
     sourceId: r.source_id,
     eventId: r.event_id,
     sourceSeq: r.source_seq,
@@ -51,23 +56,35 @@ function toSegment(r: EventRow): Segment {
     text: r.text,
     startMs: r.start_ms,
   };
+  const corr = corrections?.get(correctionKey(r.source_id, r.event_id));
+  if (corr) {
+    return { ...base, text: corr.text, originalText: r.text, correction: corr };
+  }
+  return base;
 }
 
-export function buildSnapshot(sessionId: string, revision: number, rows: EventRow[]): Snapshot {
+export function buildSnapshot(
+  sessionId: string,
+  revision: number,
+  rows: EventRow[],
+  corrections?: Map<string, CorrectionInfo>,
+): Snapshot {
   const finals = rows.filter((r) => r.kind === 'final').sort(compareFinals);
   const partials = rows.filter((r) => r.kind === 'partial').sort(comparePartials);
-  const text = finals.map((f) => f.text).join(' ');
+  const segments = finals.map((f) => toSegment(f, corrections));
+  const text = segments.map((s) => s.text).join(' ');
   return {
     sessionId,
     revision,
-    segments: finals.map(toSegment),
-    partials: partials.map(toSegment),
+    segments,
+    partials: partials.map((p) => toSegment(p, corrections)),
     text,
     summary: {
       sources: new Set(rows.map((r) => r.source_id)).size,
       finalSegments: finals.length,
       partialSegments: partials.length,
       characters: text.length,
+      corrections: corrections?.size ?? 0,
     },
   };
 }

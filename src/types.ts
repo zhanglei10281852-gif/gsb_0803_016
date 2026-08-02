@@ -30,16 +30,35 @@ export interface Segment {
   eventId: string;
   sourceSeq: number;
   kind: EventKind;
+  /** Effective text: the latest correction when one exists, else the original. */
   text: string;
   startMs: number | null;
+  /** Original ASR text; only present when the segment was corrected. */
+  originalText?: string;
+  /** Latest human correction applied to this segment, if any. */
+  correction?: CorrectionInfo;
+}
+
+/** A human correction. Original events are never rewritten; corrections form a supersedes chain. */
+export interface CorrectionInfo {
+  correctionId: string;
+  text: string;
+  actor: string;
+  reason: string;
+  /** Stream revision at which this correction was committed. */
+  revision: number;
+  /** correctionId of the previous correction for the same segment, or null. */
+  supersedes: string | null;
 }
 
 export interface Summary {
   sources: number;
   finalSegments: number;
   partialSegments: number;
-  /** Character count of the joined final text. */
+  /** Character count of the joined (effective) final text. */
   characters: number;
+  /** Segments carrying a human correction. */
+  corrections: number;
 }
 
 export interface Snapshot {
@@ -57,12 +76,54 @@ export interface Snapshot {
 
 /** What an applied ingest changed; stored as the payload of a revision. */
 export interface ChangeRecord {
-  type: EventKind;
+  /** 'partial' | 'final' come from ASR ingest; 'correction' from human review. */
+  type: EventKind | 'correction';
   sourceId: string;
   eventId: string;
   sourceSeq: number;
+  /** Event text, or the corrected text for corrections. */
   text: string;
   startMs: number | null;
+  /** Correction-only fields (absent for ASR events). */
+  correctionId?: string;
+  actor?: string;
+  reason?: string;
+  supersedes?: string | null;
+}
+
+/** Reference to a stored segment, used as the target of leases/corrections. */
+export interface SegmentRef {
+  sourceId: string;
+  eventId: string;
+}
+
+export interface AcquireLeaseOptions {
+  /** Reviewer identity; recorded on the lease and the correction. */
+  actor: string;
+  /** Session revision the reviewer's view is based on. */
+  baseRevision: number;
+  /** Lease time-to-live in milliseconds. */
+  ttlMs: number;
+}
+
+export interface LeaseInfo {
+  leaseId: string;
+  expiresAt: number;
+}
+
+export interface SubmitCorrectionOptions {
+  leaseId: string;
+  /** Must match the lease's baseRevision and cover the target's current version. */
+  baseRevision: number;
+  text: string;
+  actor: string;
+  reason: string;
+}
+
+export interface SubmitCorrectionResult {
+  status: 'applied';
+  revision: number;
+  correctionId: string;
 }
 
 export interface RevisionEntry {

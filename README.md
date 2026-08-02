@@ -54,6 +54,41 @@ for (const e of entries) {
 }
 ```
 
+## 人工复核：租约 + 校正
+
+复核员必须先基于自己看到的 `baseRevision` 领取目标 final 片段的时限租约，再凭租约提交校正：
+
+```ts
+import { ReviewConflictError } from 'asr-transcript-store';
+
+const base = store.snapshot('session-42').revision;   // 复核员看到的版本
+const target = { sourceId: 'mic-0', eventId: 'mic-0-e16' };
+
+try {
+  const lease = store.acquireLease('session-42', target, {
+    actor: 'reviewer-7', baseRevision: base, ttlMs: 5 * 60_000,
+  });
+  const r = store.submitCorrection('session-42', target, {
+    leaseId: lease.leaseId, baseRevision: base,
+    text: '你好，世界！', actor: 'reviewer-7', reason: '标点',
+  });
+  // r.revision 是修订流中新的 revision（change.type === 'correction'）
+} catch (e) {
+  if (e instanceof ReviewConflictError) {
+    // e.reason: 'lease_held'（他人持有租约）| 'no_lease'（无租约/ID 不符）
+    //         | 'lease_expired'（租约已过期）| 'stale_base'（基于旧版本）
+  } else throw e;
+}
+```
+
+语义要点：
+
+- 每个片段同一时刻至多一个活跃租约；竞争领取只有一个成功，其余得 `lease_held`；租约过期后他人可领取。`releaseLease` 可主动释放。
+- 提交时校验租约存活、leaseId 匹配、`baseRevision` 不落后于该片段当前版本（原始事件的应用 revision 或最近一次校正的 revision），违反即以 `ReviewConflictError` 结束。
+- 校正不改写原识别事件：原事件保持原样（重复/乱序/final 不回退规则不变），校正记录 actor、reason，并通过 `supersedes` 串起同一片段的校正谱系。
+- 校正在单个事务里消费租约 + 追加 `type: 'correction'` 的 revision，现有消费者用 `poll`/`ack` 原样续读；快照中 `segment.text` 为生效文本，`originalText` 与 `correction` 保留原文和校正元数据。
+- 租约与校正都在 SQLite 中持久化，承受进程重启与多实例并发。
+
 同一数据库文件可以被多个 `TranscriptStore` 实例（同进程或不同进程）同时读写；写操作串行化在 SQLite 层完成。
 
 ## 摄入语义
@@ -83,7 +118,7 @@ for (const e of entries) {
 
 ## API 摘要
 
-- `new TranscriptStore(file, { busyTimeoutMs? })` — `file` 为 SQLite 路径或 `':memory:'`
+- `new TranscriptStore(file, { busyTimeoutMs?, now? })` — `file` 为 SQLite 路径或 `':memory:'`；`now` 为时钟注入（测试用）
 - `ingest(sessionId, sourceId, event) → { status, revision }`
 - `ingestBatch(sessionId, sourceId, events) → IngestResult[]` — 整批原子，任一冲突则全批回滚
 - `snapshot(sessionId) → Snapshot`
@@ -91,6 +126,10 @@ for (const e of entries) {
 - `poll(consumerId, sessionId, limit?) → { entries, ackedRevision, lastRevision }`
 - `ack(consumerId, sessionId, revision) → number`（生效后的游标）
 - `cursor(consumerId, sessionId) → number`
+- `acquireLease(sessionId, target, { actor, baseRevision, ttlMs }) → { leaseId, expiresAt }`
+- `submitCorrection(sessionId, target, { leaseId, baseRevision, text, actor, reason }) → { status, revision, correctionId }`
+- `releaseLease(sessionId, target, leaseId) → boolean`
+- `lease(sessionId, target) → { leaseId, actor, baseRevision, expiresAt } | null`
 - `close()`
 
 另导出 `ReferenceModel`（纯内存的同等语义实现），供使用方在自己的测试里做交叉校验。
