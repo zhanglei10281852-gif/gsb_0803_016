@@ -12,6 +12,13 @@
 export type EventKind = "partial" | "final";
 
 /**
+ * Provenance of a revision in the durable stream:
+ *  - "recognition": produced by applying a raw source event.
+ *  - "correction":  produced by a human reviewer submitting a correction.
+ */
+export type RevisionOrigin = "recognition" | "correction";
+
+/**
  * A single recognizer output for one segment.
  *
  * Identity rules:
@@ -74,6 +81,14 @@ export interface SegmentState {
   eventId: string;
   /** Revision at which this segment reached its current state. */
   revision: number;
+  /**
+   * Where the current text came from: raw recognition ("recognition") or a
+   * human correction ("correction"). Corrections are authoritative and are
+   * never rolled back by later recognition events.
+   */
+  origin: RevisionOrigin;
+  /** Actor who produced the current state, when it came from a correction. */
+  actor: string | null;
 }
 
 /** Aggregated, deterministic summary of a session snapshot. */
@@ -112,6 +127,16 @@ export interface RevisionRecord {
   sourceSeq: number;
   /** Wall-clock ms when the revision was recorded. */
   createdAt: number;
+  /** Provenance: "recognition" for source events, "correction" for reviews. */
+  origin: RevisionOrigin;
+  /** Reviewer identity for correction revisions; null for recognition. */
+  actor: string | null;
+  /** Reason supplied by the reviewer; null for recognition. */
+  reason: string | null;
+  /** Stable correction id; null for recognition. */
+  correctionId: string | null;
+  /** The revision this correction superseded (its baseRevision); null otherwise. */
+  supersedesRevision: number | null;
 }
 
 /** Options for {@link RevisionHub.pull}. */
@@ -136,4 +161,65 @@ export interface RevisionHubOptions {
   synchronous?: "FULL" | "NORMAL";
   /** busy_timeout in ms for cross-process write contention. Default 5000. */
   busyTimeoutMs?: number;
+  /**
+   * Time source in epoch ms. Defaults to `Date.now`. Injectable so lease TTL
+   * expiry is testable deterministically without real sleeps.
+   */
+  clock?: () => number;
+}
+
+/** A segment address: which recognizer segment a review targets. */
+export interface SegmentRef {
+  sessionId: string;
+  sourceId: string;
+  segmentId: string;
+}
+
+/** Request to acquire a time-boxed correction lease on a segment. */
+export interface AcquireLeaseRequest extends SegmentRef {
+  /** Reviewer identity taking the lease. */
+  actor: string;
+  /**
+   * The revision the reviewer based their view on. The correction will only be
+   * accepted if the segment is still at this revision at submit time.
+   */
+  baseRevision: number;
+  /** Lease lifetime in ms from acquisition. Must be a positive integer. */
+  ttlMs: number;
+}
+
+/** A granted correction lease. */
+export interface Lease extends SegmentRef {
+  leaseId: string;
+  actor: string;
+  baseRevision: number;
+  /** Epoch ms when acquired. */
+  acquiredAt: number;
+  /** Epoch ms when the lease expires (acquiredAt + ttlMs). */
+  expiresAt: number;
+}
+
+/** Request to submit a correction under a previously granted lease. */
+export interface SubmitCorrectionRequest {
+  leaseId: string;
+  /** Must match the lease holder. */
+  actor: string;
+  /** The corrected text for the segment. */
+  text: string;
+  /** Human-readable reason / justification for the correction. */
+  reason: string;
+  /** Optional idempotency key; a re-submit with the same id is idempotent. */
+  correctionId?: string;
+}
+
+/** Result of a successful {@link RevisionHub.submitCorrection}. */
+export interface CorrectionResult extends SegmentRef {
+  correctionId: string;
+  actor: string;
+  /** The new revision assigned to this correction. */
+  revision: number;
+  /** The revision it superseded (the lease's baseRevision). */
+  supersedesRevision: number;
+  /** True when this was a fresh apply; false when an idempotent replay. */
+  applied: boolean;
 }

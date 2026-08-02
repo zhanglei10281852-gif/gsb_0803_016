@@ -4,13 +4,21 @@ import type { RevisionHubOptions } from "./types";
 export type DB = Database.Database;
 
 /**
- * The schema is deliberately small and normalised around three concerns:
+ * The schema is deliberately small and normalised around these concerns:
  *
  *  - `events`      : the append-only log of everything we were told, keyed by
  *                    the source-stable (session, source, eventId). This is the
  *                    ground truth used for idempotency and conflict detection.
- *  - `segments`    : the resolved winner per (session, source, segmentId).
- *  - `revisions`   : the durable, session-monotonic change stream.
+ *                    Human corrections NEVER write here — raw recognition is
+ *                    preserved verbatim.
+ *  - `segments`    : the resolved winner per (session, source, segmentId),
+ *                    including its provenance (recognition vs correction).
+ *  - `revisions`   : the durable, session-monotonic change stream. Recognition
+ *                    and correction revisions share this one stream so existing
+ *                    consumers read corrections as ordinary new revisions.
+ *  - `corrections` : append-only lineage of human corrections (actor, reason,
+ *                    supersedes), separate from raw events.
+ *  - `leases`      : time-boxed, single-winner correction leases per segment.
  *  - `sessions`    : per-session head revision counter (revision allocator).
  *  - `consumers`   : durable per-consumer read cursors.
  *
@@ -18,7 +26,7 @@ export type DB = Database.Database;
  * so a crash can never leave a revision without its segment update, or a
  * cursor advanced past data that was rolled back.
  */
-const SCHEMA_VERSION = 1;
+const SCHEMA_VERSION = 2;
 
 const SCHEMA_SQL = `
 CREATE TABLE IF NOT EXISTS meta (
@@ -60,25 +68,64 @@ CREATE TABLE IF NOT EXISTS segments (
   event_id    TEXT NOT NULL,
   finalized   INTEGER NOT NULL DEFAULT 0,
   revision    INTEGER NOT NULL,
+  origin      TEXT NOT NULL DEFAULT 'recognition',
+  actor       TEXT,
   PRIMARY KEY (session_id, source_id, segment_id)
 );
 
--- Durable, per-session monotonic change stream.
+-- Durable, per-session monotonic change stream (recognition + corrections).
 CREATE TABLE IF NOT EXISTS revisions (
-  session_id  TEXT NOT NULL,
-  revision    INTEGER NOT NULL,
-  source_id   TEXT NOT NULL,
-  segment_id  TEXT NOT NULL,
-  kind        TEXT NOT NULL,
-  text        TEXT NOT NULL,
-  start_ms    INTEGER,
-  end_ms      INTEGER,
-  event_id    TEXT NOT NULL,
-  source_seq  INTEGER NOT NULL,
-  created_at  INTEGER NOT NULL,
+  session_id          TEXT NOT NULL,
+  revision            INTEGER NOT NULL,
+  source_id           TEXT NOT NULL,
+  segment_id          TEXT NOT NULL,
+  kind                TEXT NOT NULL,
+  text                TEXT NOT NULL,
+  start_ms            INTEGER,
+  end_ms              INTEGER,
+  event_id            TEXT NOT NULL,
+  source_seq          INTEGER NOT NULL,
+  created_at          INTEGER NOT NULL,
+  origin              TEXT NOT NULL DEFAULT 'recognition',
+  actor               TEXT,
+  reason              TEXT,
+  correction_id       TEXT,
+  supersedes_revision INTEGER,
   PRIMARY KEY (session_id, revision)
 );
 CREATE INDEX IF NOT EXISTS idx_revisions_session ON revisions (session_id, revision);
+
+-- Append-only lineage of human corrections (never touches raw events).
+CREATE TABLE IF NOT EXISTS corrections (
+  session_id          TEXT NOT NULL,
+  correction_id       TEXT NOT NULL,
+  source_id           TEXT NOT NULL,
+  segment_id          TEXT NOT NULL,
+  actor               TEXT NOT NULL,
+  reason              TEXT NOT NULL,
+  text                TEXT NOT NULL,
+  base_revision       INTEGER NOT NULL,
+  revision            INTEGER NOT NULL,
+  supersedes_revision INTEGER NOT NULL,
+  lease_id            TEXT NOT NULL,
+  created_at          INTEGER NOT NULL,
+  PRIMARY KEY (session_id, correction_id)
+);
+
+-- Time-boxed, single-winner correction leases per segment.
+CREATE TABLE IF NOT EXISTS leases (
+  session_id    TEXT NOT NULL,
+  source_id     TEXT NOT NULL,
+  segment_id    TEXT NOT NULL,
+  lease_id      TEXT NOT NULL,
+  actor         TEXT NOT NULL,
+  base_revision INTEGER NOT NULL,
+  acquired_at   INTEGER NOT NULL,
+  expires_at    INTEGER NOT NULL,
+  released      INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (session_id, source_id, segment_id)
+);
+CREATE INDEX IF NOT EXISTS idx_leases_id ON leases (session_id, lease_id);
 
 -- Durable read cursors.
 CREATE TABLE IF NOT EXISTS consumers (
@@ -101,14 +148,54 @@ export function openDb(opts: RevisionHubOptions): DB {
   db.pragma("foreign_keys = ON");
   db.pragma(`busy_timeout = ${opts.busyTimeoutMs ?? 5000}`);
 
+  // Create any missing tables first (fresh DBs get the full v2 shape).
   db.exec(SCHEMA_SQL);
+
   const row = db.prepare("SELECT value FROM meta WHERE key = 'schema_version'").get() as
     | { value: string }
     | undefined;
-  if (!row) {
-    db.prepare("INSERT INTO meta (key, value) VALUES ('schema_version', ?)").run(
-      String(SCHEMA_VERSION),
-    );
+  const current = row ? Number(row.value) : 0;
+
+  if (current < SCHEMA_VERSION) {
+    migrate(db, current);
+    db.prepare(
+      `INSERT INTO meta (key, value) VALUES ('schema_version', ?)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
+    ).run(String(SCHEMA_VERSION));
   }
   return db;
+}
+
+/** Column names that already exist on a table. */
+function columnsOf(db: DB, table: string): Set<string> {
+  const rows = db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>;
+  return new Set(rows.map((r) => r.name));
+}
+
+/**
+ * Forward-only migrations. v1 stores predate the correction/lease feature, so
+ * we add the provenance columns to `segments`/`revisions` in place (existing
+ * rows default to origin='recognition'); the `corrections`/`leases` tables were
+ * already created by SCHEMA_SQL above.
+ */
+function migrate(db: DB, from: number): void {
+  const run = db.transaction(() => {
+    if (from < 2) {
+      const segCols = columnsOf(db, "segments");
+      if (!segCols.has("origin"))
+        db.exec("ALTER TABLE segments ADD COLUMN origin TEXT NOT NULL DEFAULT 'recognition'");
+      if (!segCols.has("actor")) db.exec("ALTER TABLE segments ADD COLUMN actor TEXT");
+
+      const revCols = columnsOf(db, "revisions");
+      if (!revCols.has("origin"))
+        db.exec("ALTER TABLE revisions ADD COLUMN origin TEXT NOT NULL DEFAULT 'recognition'");
+      if (!revCols.has("actor")) db.exec("ALTER TABLE revisions ADD COLUMN actor TEXT");
+      if (!revCols.has("reason")) db.exec("ALTER TABLE revisions ADD COLUMN reason TEXT");
+      if (!revCols.has("correction_id"))
+        db.exec("ALTER TABLE revisions ADD COLUMN correction_id TEXT");
+      if (!revCols.has("supersedes_revision"))
+        db.exec("ALTER TABLE revisions ADD COLUMN supersedes_revision INTEGER");
+    }
+  });
+  run();
 }

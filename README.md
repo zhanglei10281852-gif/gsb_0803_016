@@ -24,8 +24,14 @@ This library turns that into a consistent, replayable truth:
 - Every effective change gets a **session-monotonic `revision`**; consumers
   read by `consumerId` + durable `cursor` with **no re-sends** of acked ranges
   and **no gaps** in unacked ranges.
-- State, revision log, and cursors stay **consistent across process crashes /
-  power loss** — never a half-written result.
+- **Human review with correction leases**: a reviewer takes a time-boxed lease
+  on a segment (based on a `baseRevision`), and only the lease holder may submit
+  a correction. Competing claims yield a single winner; expired or stale-base
+  submits fail with **distinguishable** errors. Corrections don't rewrite the
+  raw recognition — they keep `actor`/`reason`/`supersedes` lineage and land as
+  **new revisions in the same stream** existing consumers already read.
+- State, revision log, cursors, leases, and corrections stay **consistent
+  across process crashes / power loss** — never a half-written result.
 
 ## Install / build
 
@@ -90,6 +96,58 @@ So the safe pattern is: **pull → process → ack the last processed revision**
 If the process dies before `ack`, the same batch is re-delivered on restart
 (at-least-once with idempotent processing). Acked revisions are never re-sent.
 
+### Human review: correction leases
+
+Corrections flow through the *same* revision stream, so a consumer that already
+reads recognition revisions automatically receives corrections too — it just
+sees records whose `origin` is `"correction"` carrying `actor`, `reason`,
+`correctionId`, and `supersedesRevision`.
+
+```ts
+// A reviewer sees the segment at some baseRevision and claims a time-boxed lease.
+const snap = hub.getSnapshot("call-42");
+const seg = snap.segments.find((s) => s.segmentId === "utt-7")!;
+
+const lease = hub.acquireLease({
+  sessionId: "call-42",
+  sourceId: seg.sourceId,
+  segmentId: "utt-7",
+  actor: "reviewer-1",
+  baseRevision: seg.revision, // the state being corrected
+  ttlMs: 60_000,
+});
+// A competing acquireLease while this lease is live throws LeaseConflictError.
+
+try {
+  const res = hub.submitCorrection({
+    leaseId: lease.leaseId,
+    actor: "reviewer-1",
+    text: "hello world",
+    reason: "spelling",
+    correctionId: "opt-idempotency-key", // optional; re-submit is idempotent
+  });
+  // res.revision is the new stream revision; res.supersedesRevision === baseRevision
+} catch (err) {
+  // Distinguishable outcomes (all extend HubError, each with a distinct .code):
+  //  - LeaseExpiredError  ("LEASE_EXPIRED"): the TTL elapsed before submit
+  //  - StaleBaseError     ("STALE_BASE"):    a newer revision landed since the lease
+  //  - NoLeaseError       ("NO_LEASE"):      unknown lease / wrong actor / released
+}
+```
+
+Guarantees:
+
+- **Single winner:** while a lease is live, only its holder can submit; other
+  acquisitions get `LeaseConflictError`. An *expired* lease can be taken over.
+- **Base enforcement:** a submit succeeds only if the segment is still at the
+  lease's `baseRevision`; otherwise `StaleBaseError` — so a correction built on a
+  stale view never silently clobbers newer state.
+- **Raw recognition preserved:** corrections never touch the `events` table.
+  Lineage (`actor`, `reason`, `supersedes`, `leaseId`) is recorded in a separate
+  `corrections` table, and the segment flips to `origin="correction"`.
+- **Corrections are authoritative:** once a segment is corrected, later
+  recognition events are `superseded` (extends the final-no-rollback rule).
+
 ## Data model
 
 - A **session** contains many **sources**; each source emits events for
@@ -97,9 +155,11 @@ If the process dies before `ack`, the same batch is re-delivered on restart
 - The winner for a segment is chosen by a **total precedence order**
   `(final > partial, then higher sourceSeq, then eventId tie-break)`. Because
   this is a total order, folding it over the received events is
-  order-independent — hence deterministic convergence.
-- An `apply` that changes a segment's resolved state allocates the next
-  `revision` and appends to the `revisions` table, all in one transaction.
+  order-independent — hence deterministic convergence. A human correction
+  outranks all recognition for that segment.
+- An `apply` (recognition) or `submitCorrection` (review) that changes a
+  segment's resolved state allocates the next `revision` and appends to the
+  shared `revisions` table, all in one transaction.
 
 ## Durability & concurrency (key trade-offs)
 
@@ -125,12 +185,23 @@ If the process dies before `ack`, the same batch is re-delivered on restart
 ## Public API surface
 
 - `RevisionHub.open(options)` / `new RevisionHub(options)` / `.close()`
+  - `options`: `{ path, synchronous?, busyTimeoutMs?, clock? }` (`clock` injects a
+    time source, mainly for deterministic lease-TTL tests).
 - `apply(event)` → `ApplyResult`, `applyBatch(events)`
 - `getSnapshot(sessionId)` → `Snapshot`, `headRevision(sessionId)`
 - `pull(sessionId, consumerId, opts?)` → `RevisionRecord[]`
 - `ack(sessionId, consumerId, uptoRevision)` → new cursor
 - `getCursor(sessionId, consumerId, autoCreate?)`
-- Errors: `ConflictError`, `ValidationError` (both extend `HubError`)
+- Human review: `acquireLease(req)` → `Lease`, `submitCorrection(req)` →
+  `CorrectionResult`, `getLease(sessionId, sourceId, segmentId)`,
+  `releaseLease(leaseId, actor)`
+- Errors (all extend `HubError` with a `.code`): `ConflictError`,
+  `ValidationError`, `LeaseConflictError`, `LeaseExpiredError`, `NoLeaseError`,
+  `StaleBaseError`
+
+Existing v1 stores are migrated in place on open (provenance columns added,
+defaulting to `origin="recognition"`); the previously documented API is
+unchanged and remains source-compatible.
 
 See `src/types.ts` for full type definitions.
 
@@ -140,7 +211,9 @@ All tests run **offline**.
 
 - `npm test` — unit/integration: idempotency, conflict rejection, stale/final
   rules, revision monotonicity, determinism across many shuffled/duplicated
-  orderings, and consumer cursor semantics (including a no-loss/no-dup fuzz).
+  orderings, consumer cursor semantics (including a no-loss/no-dup fuzz), the
+  full correction/lease flow (single-winner, TTL expiry, stale base, no-rollback,
+  idempotent re-submit, supersedes lineage), and a v1→v2 migration test.
 - `npm run e2e` — simulations:
   - **Multi-instance concurrency:** 5 child processes write the same logical
     stream (with 25% overlapping deliveries) to one SQLite file; the resolved
@@ -151,6 +224,13 @@ All tests run **offline**.
   - **Slow consumer:** a producer streams while a deliberately slow consumer
     pulls/acks in small batches, plus a consumer-restart test — every revision
     delivered exactly once, in order, resuming at the durable cursor.
+  - **Lease contention:** 6 reviewer processes concurrently contend for leases
+    on shared segments; exactly one correction wins per base revision, the
+    stream stays dense, every segment resolves to a correction winner, and raw
+    events remain untouched.
+  - **Correction power loss:** a reviewer process is `SIGKILL`-ed mid-correction;
+    the store stays consistent (no segment flipped without its lineage +
+    stream revision) and the review completes on resume.
 
 ## License
 
