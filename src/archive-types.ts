@@ -18,6 +18,9 @@ export interface ArchiveHeader {
   recordCount: number;
   dataHashAlgorithm: "sha256";
   dataHash: string;
+  prevArchiveHash?: string;
+  baseCheckpointId?: string;
+  checkpointId?: string;
 }
 
 export interface ArchiveEventRecord {
@@ -71,6 +74,29 @@ export interface ArchiveCursorRecord {
   consumerId: string;
   cursor: number;
   updatedAt: number;
+  leaseTtlMs?: number;
+  lastSeenAt?: number;
+  resetToCheckpoint?: string;
+}
+
+export interface ArchiveCheckpointRecord {
+  checkpointId: string;
+  revision: number;
+  archiveHash: string;
+  prevArchiveHash?: string;
+  recordCount: number;
+  createdAt: number;
+}
+
+export interface ArchiveCompactionStateRecord {
+  compactedThroughRevision: number;
+  baselineRevision: number;
+  lastCheckpointId?: string;
+  lastCompactedAt?: number;
+  totalRevisionsRemoved: number;
+  totalEventsRemoved: number;
+  totalCorrectionsRemoved: number;
+  totalLeasesRemoved: number;
 }
 
 export type ArchiveKnownData =
@@ -78,7 +104,9 @@ export type ArchiveKnownData =
   | { type: "revision"; data: ArchiveRevisionRecord }
   | { type: "correction"; data: ArchiveCorrectionRecord }
   | { type: "lease"; data: ArchiveLeaseRecord }
-  | { type: "cursor"; data: ArchiveCursorRecord };
+  | { type: "cursor"; data: ArchiveCursorRecord }
+  | { type: "checkpoint"; data: ArchiveCheckpointRecord }
+  | { type: "compaction"; data: ArchiveCompactionStateRecord };
 
 export interface ArchiveUnknownData {
   type: string;
@@ -101,6 +129,7 @@ export interface ArchiveImportResult {
     corrections: number;
     leases: number;
     cursors: number;
+    checkpoints: number;
     unknown: number;
   };
   duplicates: {
@@ -109,6 +138,7 @@ export interface ArchiveImportResult {
     corrections: number;
     leases: number;
     cursors: number;
+    checkpoints: number;
   };
   conflicting: number;
 }

@@ -1,10 +1,5 @@
 import type Database from "better-sqlite3";
-import type {
-  CorrectionInfo,
-  Segment,
-  SegmentKind,
-  Snapshot,
-} from "./types";
+import type { CorrectionInfo, Segment, SegmentKind, Snapshot } from "./types";
 
 interface SegmentRow {
   source_id: string;
@@ -112,26 +107,28 @@ WHERE session_id = ?
 `;
 
 const MAX_REVISION_SQL = `
-SELECT COALESCE(MAX(revision), 0) AS revision
-FROM revisions
-WHERE session_id = ?
+SELECT COALESCE(
+  (SELECT MAX(revision) FROM revisions WHERE session_id = ?),
+  (SELECT baseline_revision FROM compaction_state WHERE session_id = ?),
+  0
+) AS revision
 `;
 
 export interface SnapshotStatements {
   segments: Database.Statement<[string, string, string, string], SegmentRow>;
   stats: Database.Statement<[string], StatsRow>;
-  maxRevision: Database.Statement<[string], RevisionRow>;
+  maxRevision: Database.Statement<[string, string], RevisionRow>;
 }
 
 export function createSnapshotStatements(
-  db: Database.Database
+  db: Database.Database,
 ): SnapshotStatements {
   return {
     segments: db.prepare<[string, string, string, string], SegmentRow>(
-      BASE_SEGMENTS_SQL
+      BASE_SEGMENTS_SQL,
     ),
     stats: db.prepare<[string], StatsRow>(STATS_SQL),
-    maxRevision: db.prepare<[string], RevisionRow>(MAX_REVISION_SQL),
+    maxRevision: db.prepare<[string, string], RevisionRow>(MAX_REVISION_SQL),
   };
 }
 
@@ -175,16 +172,16 @@ function toSegment(row: SegmentRow): Segment {
 
 export function buildSnapshot(
   statements: SnapshotStatements,
-  sessionId: string
+  sessionId: string,
 ): Snapshot {
-  const revisionRow = statements.maxRevision.get(sessionId);
+  const revisionRow = statements.maxRevision.get(sessionId, sessionId);
   const revision = revisionRow?.revision ?? 0;
   const stats = statements.stats.get(sessionId);
   const segmentRows = statements.segments.all(
     sessionId,
     sessionId,
     sessionId,
-    sessionId
+    sessionId,
   );
 
   if ((stats?.event_count ?? 0) === 0) {
@@ -214,11 +211,11 @@ export function buildSnapshot(
     .join("");
   const text = segments.map((segment) => segment.text).join("");
   const finalSegmentCount = segments.filter(
-    (segment) => segment.kind === "final"
+    (segment) => segment.kind === "final",
   ).length;
   const activePartialCount = segments.length - finalSegmentCount;
   const correctedSegmentCount = segments.filter(
-    (segment) => segment.correction !== undefined
+    (segment) => segment.correction !== undefined,
   ).length;
 
   return {

@@ -12,6 +12,7 @@ import {
   importSessionArchive,
   importSessionArchiveFile,
   writeSessionArchive,
+  type ExportArchiveOptions,
   type ImportSessionArchiveOptions,
 } from "./archive";
 import type {
@@ -19,21 +20,29 @@ import type {
   SessionArchiveStream,
 } from "./archive-types";
 import {
+  ConsumerResetRequiredError,
   EventConflictError,
   InvalidEventError,
   RecognitionStoreError,
   ReviewConflictError,
+  RevisionCompactedError,
   RevisionNotFoundError,
 } from "./errors";
 import type {
+  ArchiveCheckpoint,
   ChangeType,
   ClaimLeaseInput,
   ClaimLeaseOutcome,
+  CompactOptions,
+  CompactionResult,
+  CompactionState,
+  CompactionStats,
   CorrectionRecord,
   IngestOutcome,
   NormalizedRecognitionEvent,
   RecognitionEventInput,
   RecognitionStore as RecognitionStoreLike,
+  RegisterCheckpointInput,
   ReviewLease,
   RevisionConsumer,
   RevisionRecord,
@@ -80,6 +89,17 @@ interface RevisionRow {
 
 interface CursorRow {
   cursor: number;
+  lease_ttl_ms: number;
+  last_seen_at: number;
+  reset_to_checkpoint: string | null;
+}
+
+interface ConsumerRow {
+  consumer_id: string;
+  cursor: number;
+  lease_ttl_ms: number;
+  last_seen_at: number;
+  reset_to_checkpoint: string | null;
 }
 
 interface NextRevisionRow {
@@ -283,6 +303,22 @@ class SQLiteRevisionConsumer implements RevisionConsumer {
   getCursor(): number {
     return this.store.getCursor(this.sessionId, this.consumerId);
   }
+
+  resetToCheckpoint(checkpointId: string): number {
+    return this.store.resetConsumerToCheckpoint(
+      this.sessionId,
+      this.consumerId,
+      checkpointId,
+    );
+  }
+
+  heartbeat(ttlMs?: number): number {
+    return this.store.touchConsumerLease(
+      this.sessionId,
+      this.consumerId,
+      ttlMs,
+    );
+  }
 }
 
 export class RecognitionStore implements RecognitionStoreLike {
@@ -364,8 +400,14 @@ export class RecognitionStore implements RecognitionStoreLike {
     const revisionForEvent = this.db.prepare<[string, string], CursorRow>(
       `SELECT revision AS cursor FROM revisions WHERE session_id = ? AND event_id = ?`,
     );
-    const nextRevisionForSession = this.db.prepare<[string], NextRevisionRow>(
-      `SELECT COALESCE(MAX(revision), 0) + 1 AS revision
+    const nextRevisionForSession = this.db.prepare<
+      [string, string],
+      NextRevisionRow
+    >(
+      `SELECT COALESCE(MAX(revision),
+        (SELECT baseline_revision FROM compaction_state WHERE session_id = ?),
+        0
+      ) + 1 AS revision
        FROM revisions WHERE session_id = ?`,
     );
     const insertRevision = this.db.prepare(
@@ -442,7 +484,7 @@ export class RecognitionStore implements RecognitionStoreLike {
             continue;
           }
 
-          const nextRow = nextRevisionForSession.get(sessionId);
+          const nextRow = nextRevisionForSession.get(sessionId, sessionId);
           const revision = nextRow?.revision ?? 1;
           const snapshot = buildSnapshot(this.snapshots, sessionId);
           const completedSnapshot: Snapshot = {
@@ -528,8 +570,14 @@ export class RecognitionStore implements RecognitionStoreLike {
          (SELECT text FROM base)
        ) AS text`,
     );
-    const currentMaxRevision = this.db.prepare<[string], MaxRevisionRow>(
-      `SELECT COALESCE(MAX(revision), 0) AS max_revision
+    const currentMaxRevision = this.db.prepare<
+      [string, string],
+      MaxRevisionRow
+    >(
+      `SELECT COALESCE(MAX(revision),
+        (SELECT baseline_revision FROM compaction_state WHERE session_id = ?),
+        0
+      ) AS max_revision
        FROM revisions WHERE session_id = ?`,
     );
     const previousCorrection = this.db.prepare<
@@ -718,7 +766,7 @@ export class RecognitionStore implements RecognitionStoreLike {
         }
 
         const currentRevision =
-          currentMaxRevision.get(sessionId)?.max_revision ?? 0;
+          currentMaxRevision.get(sessionId, sessionId)?.max_revision ?? 0;
         if (input.baseRevision !== currentRevision) {
           throw new ReviewConflictError(
             "base-revision-stale",
@@ -771,7 +819,7 @@ export class RecognitionStore implements RecognitionStoreLike {
           now,
         );
 
-        const nextRow = nextRevisionForSession.get(sessionId);
+        const nextRow = nextRevisionForSession.get(sessionId, sessionId);
         const revision = nextRow?.revision ?? 1;
         const snapshot = buildSnapshot(this.snapshots, sessionId);
         const completedSnapshot: Snapshot = {
@@ -821,29 +869,236 @@ export class RecognitionStore implements RecognitionStoreLike {
        LIMIT ?`,
     );
     const cursor = this.db.prepare<[string, string], CursorRow>(
-      `SELECT cursor FROM consumer_cursors WHERE session_id = ? AND consumer_id = ?`,
+      `SELECT cursor, lease_ttl_ms, last_seen_at, reset_to_checkpoint
+       FROM consumer_cursors WHERE session_id = ? AND consumer_id = ?`,
     );
-    const maxRevision = this.db.prepare<[string], MaxRevisionRow>(
-      `SELECT COALESCE(MAX(revision), 0) AS max_revision
+    const touchConsumer = this.db.prepare(
+      `UPDATE consumer_cursors
+       SET last_seen_at = ?, lease_ttl_ms = ?
+       WHERE session_id = ? AND consumer_id = ?`,
+    );
+    const ensureConsumer = this.db.prepare(
+      `INSERT INTO consumer_cursors(
+         session_id, consumer_id, cursor, updated_at, lease_ttl_ms, last_seen_at
+       ) VALUES(?, ?, 0, ?, ?, ?)
+       ON CONFLICT(session_id, consumer_id) DO NOTHING`,
+    );
+    const activeConsumers = this.db.prepare<[string, number], ConsumerRow>(
+      `SELECT consumer_id, cursor, lease_ttl_ms, last_seen_at, reset_to_checkpoint
+       FROM consumer_cursors
+       WHERE session_id = ? AND last_seen_at + lease_ttl_ms > ?`,
+    );
+    const resetCursorToCheckpoint = this.db.prepare(
+      `UPDATE consumer_cursors
+       SET cursor = ?, reset_to_checkpoint = ?, updated_at = ?, last_seen_at = ?
+       WHERE session_id = ? AND consumer_id = ?`,
+    );
+    const maxRevision = this.db.prepare<[string, string], MaxRevisionRow>(
+      `SELECT COALESCE(MAX(revision),
+        (SELECT baseline_revision FROM compaction_state WHERE session_id = ?),
+        0
+      ) AS max_revision
        FROM revisions WHERE session_id = ?`,
     );
     const upsertCursor = this.db.prepare(
-      `INSERT INTO consumer_cursors(session_id, consumer_id, cursor, updated_at)
-       VALUES(?, ?, ?, ?)
+      `INSERT INTO consumer_cursors(
+         session_id, consumer_id, cursor, updated_at, lease_ttl_ms, last_seen_at
+       ) VALUES(?, ?, ?, ?, ?, ?)
        ON CONFLICT(session_id, consumer_id) DO UPDATE SET
          cursor = excluded.cursor,
          updated_at = excluded.updated_at
        WHERE consumer_cursors.cursor < excluded.cursor`,
     );
 
+    const insertCheckpoint = this.db.prepare(
+      `INSERT OR IGNORE INTO archive_checkpoints(
+         session_id, checkpoint_id, revision, archive_hash, prev_archive_hash,
+         record_count, created_at
+       ) VALUES(?, ?, ?, ?, ?, ?, ?)`,
+    );
+    const checkpointById = this.db.prepare<
+      [string, string],
+      {
+        checkpoint_id: string;
+        revision: number;
+        archive_hash: string;
+        prev_archive_hash: string | null;
+        record_count: number;
+        created_at: number;
+      }
+    >(
+      `SELECT checkpoint_id, revision, archive_hash, prev_archive_hash,
+              record_count, created_at
+       FROM archive_checkpoints WHERE session_id = ? AND checkpoint_id = ?`,
+    );
+    const latestCheckpoint = this.db.prepare<
+      [string],
+      {
+        checkpoint_id: string;
+        revision: number;
+        archive_hash: string;
+        prev_archive_hash: string | null;
+        record_count: number;
+        created_at: number;
+      }
+    >(
+      `SELECT checkpoint_id, revision, archive_hash, prev_archive_hash,
+              record_count, created_at
+       FROM archive_checkpoints WHERE session_id = ?
+       ORDER BY revision DESC, created_at DESC, checkpoint_id DESC LIMIT 1`,
+    );
+    const allCheckpoints = this.db.prepare<
+      [string],
+      {
+        checkpoint_id: string;
+        revision: number;
+        archive_hash: string;
+        prev_archive_hash: string | null;
+        record_count: number;
+        created_at: number;
+      }
+    >(
+      `SELECT checkpoint_id, revision, archive_hash, prev_archive_hash,
+              record_count, created_at
+       FROM archive_checkpoints WHERE session_id = ?
+       ORDER BY revision ASC, created_at ASC, checkpoint_id ASC`,
+    );
+    const compactionStateRow = this.db.prepare<
+      [string],
+      {
+        compacted_through_revision: number;
+        baseline_revision: number;
+        last_checkpoint_id: string | null;
+        last_compacted_at: number | null;
+        total_revisions_removed: number;
+        total_events_removed: number;
+        total_corrections_removed: number;
+        total_leases_removed: number;
+      }
+    >(
+      `SELECT compacted_through_revision, baseline_revision, last_checkpoint_id,
+              last_compacted_at, total_revisions_removed, total_events_removed,
+              total_corrections_removed, total_leases_removed
+       FROM compaction_state WHERE session_id = ?`,
+    );
+    const deleteRevisionsBefore = this.db.prepare(
+      `DELETE FROM revisions WHERE session_id = ? AND revision <= ?`,
+    );
+    const deleteStaleEventsBefore = this.db.prepare(
+      `DELETE FROM events
+       WHERE session_id = ? AND kind = 'partial'
+         AND EXISTS (
+           SELECT 1 FROM revisions r
+           WHERE r.session_id = events.session_id
+             AND r.event_id = events.event_id
+             AND r.revision <= ?
+         )
+         AND NOT EXISTS (
+           SELECT 1 FROM revisions r2
+           WHERE r2.session_id = events.session_id
+             AND r2.event_id = events.event_id
+             AND r2.revision > ?
+         )
+         AND EXISTS (
+           SELECT 1 FROM events later
+           WHERE later.session_id = events.session_id
+             AND later.source_id = events.source_id
+             AND (
+               later.source_seq > events.source_seq
+               OR (later.source_seq = events.source_seq AND later.kind = 'final')
+             )
+         )`,
+    );
+    const deleteSupersededCorrectionsBefore = this.db.prepare(
+      `DELETE FROM corrections WHERE 0`,
+    );
+    const deleteReleasedLeasesBefore = this.db.prepare(
+      `DELETE FROM review_leases
+       WHERE session_id = ? AND released_at IS NOT NULL AND released_at <= ?
+         AND NOT EXISTS (
+           SELECT 1 FROM corrections c
+           WHERE c.session_id = review_leases.session_id
+             AND c.lease_id = review_leases.lease_id
+         )`,
+    );
+    const upsertCompactionState = this.db.prepare(
+      `INSERT INTO compaction_state(
+         session_id, compacted_through_revision, baseline_revision,
+         last_checkpoint_id, last_compacted_at, total_revisions_removed,
+         total_events_removed, total_corrections_removed, total_leases_removed
+       ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT(session_id) DO UPDATE SET
+         compacted_through_revision = excluded.compacted_through_revision,
+         baseline_revision = excluded.baseline_revision,
+         last_checkpoint_id = excluded.last_checkpoint_id,
+         last_compacted_at = excluded.last_compacted_at,
+         total_revisions_removed = compaction_state.total_revisions_removed + excluded.total_revisions_removed,
+         total_events_removed = compaction_state.total_events_removed + excluded.total_events_removed,
+         total_corrections_removed = compaction_state.total_corrections_removed + excluded.total_corrections_removed,
+         total_leases_removed = compaction_state.total_leases_removed + excluded.total_leases_removed`,
+    );
+    const countRevisionsBefore = this.db.prepare<
+      [string, number],
+      { c: number }
+    >(
+      `SELECT COUNT(*) AS c FROM revisions WHERE session_id = ? AND revision <= ?`,
+    );
+    const countStaleEventsBefore = this.db.prepare<
+      [string, number, number],
+      { c: number }
+    >(
+      `SELECT COUNT(*) AS c FROM events
+       WHERE session_id = ? AND kind = 'partial'
+         AND EXISTS (
+           SELECT 1 FROM revisions r
+           WHERE r.session_id = events.session_id
+             AND r.event_id = events.event_id
+             AND r.revision <= ?
+         )
+         AND NOT EXISTS (
+           SELECT 1 FROM revisions r2
+           WHERE r2.session_id = events.session_id
+             AND r2.event_id = events.event_id
+             AND r2.revision > ?
+         )
+         AND EXISTS (
+           SELECT 1 FROM events later
+           WHERE later.session_id = events.session_id
+             AND later.source_id = events.source_id
+             AND (
+               later.source_seq > events.source_seq
+               OR (later.source_seq = events.source_seq AND later.kind = 'final')
+             )
+         )`,
+    );
+    const countSupersededCorrectionsBefore = this.db.prepare<[], { c: number }>(
+      `SELECT 0 AS c`,
+    );
+    const countReleasedLeasesBefore = this.db.prepare<
+      [string, number],
+      { c: number }
+    >(
+      `SELECT COUNT(*) AS c FROM review_leases
+       WHERE session_id = ? AND released_at IS NOT NULL AND released_at <= ?
+         AND NOT EXISTS (
+           SELECT 1 FROM corrections c
+           WHERE c.session_id = review_leases.session_id
+             AND c.lease_id = review_leases.lease_id
+         )`,
+    );
+
     this.readTransaction = this.db.transaction(<T>(read: () => T) => read());
     this.acknowledgeTransaction = this.db.transaction(
       (sessionId: string, consumerId: string, revision: number) => {
-        const max = maxRevision.get(sessionId)?.max_revision ?? 0;
+        const max = maxRevision.get(sessionId, sessionId)?.max_revision ?? 0;
         if (revision > max) {
           throw new RevisionNotFoundError(sessionId, revision);
         }
-        upsertCursor.run(sessionId, consumerId, revision, this.clock());
+        const now = this.clock();
+        const existing = cursor.get(sessionId, consumerId);
+        const ttl = existing?.lease_ttl_ms ?? 86400000;
+        ensureConsumer.run(sessionId, consumerId, now, ttl, now);
+        upsertCursor.run(sessionId, consumerId, revision, now, ttl, now);
       },
     );
 
@@ -854,6 +1109,26 @@ export class RecognitionStore implements RecognitionStoreLike {
     this.leaseBySegmentStatement = leaseBySegment;
     this.correctionByIdStatement = correctionById;
     this.correctionsBySegmentStatement = correctionsBySegment;
+    this.touchConsumerStatement = touchConsumer;
+    this.ensureConsumerStatement = ensureConsumer;
+    this.activeConsumersStatement = activeConsumers;
+    this.resetCursorToCheckpointStatement = resetCursorToCheckpoint;
+    this.insertCheckpointStatement = insertCheckpoint;
+    this.checkpointByIdStatement = checkpointById;
+    this.latestCheckpointStatement = latestCheckpoint;
+    this.allCheckpointsStatement = allCheckpoints;
+    this.compactionStateStatement = compactionStateRow;
+    this.deleteRevisionsBeforeStatement = deleteRevisionsBefore;
+    this.deleteStaleEventsBeforeStatement = deleteStaleEventsBefore;
+    this.deleteSupersededCorrectionsBeforeStatement =
+      deleteSupersededCorrectionsBefore;
+    this.deleteReleasedLeasesBeforeStatement = deleteReleasedLeasesBefore;
+    this.upsertCompactionStateStatement = upsertCompactionState;
+    this.countRevisionsBeforeStatement = countRevisionsBefore;
+    this.countStaleEventsBeforeStatement = countStaleEventsBefore;
+    this.countSupersededCorrectionsBeforeStatement =
+      countSupersededCorrectionsBefore;
+    this.countReleasedLeasesBeforeStatement = countReleasedLeasesBefore;
   }
 
   private readonly getRevisionStatement: Database.Statement<
@@ -883,6 +1158,118 @@ export class RecognitionStore implements RecognitionStoreLike {
   private readonly correctionsBySegmentStatement: Database.Statement<
     [string, string, number],
     CorrectionRow
+  >;
+  private readonly touchConsumerStatement: Database.Statement<
+    [number, number, string, string],
+    unknown
+  >;
+  private readonly ensureConsumerStatement: Database.Statement<
+    [string, string, number, number, number],
+    unknown
+  >;
+  private readonly activeConsumersStatement: Database.Statement<
+    [string, number],
+    ConsumerRow
+  >;
+  private readonly resetCursorToCheckpointStatement: Database.Statement<
+    [number, string | null, number, number, string, string],
+    unknown
+  >;
+  private readonly insertCheckpointStatement: Database.Statement<
+    [string, string, number, string, string | null, number, number],
+    unknown
+  >;
+  private readonly checkpointByIdStatement: Database.Statement<
+    [string, string],
+    {
+      checkpoint_id: string;
+      revision: number;
+      archive_hash: string;
+      prev_archive_hash: string | null;
+      record_count: number;
+      created_at: number;
+    }
+  >;
+  private readonly latestCheckpointStatement: Database.Statement<
+    [string],
+    {
+      checkpoint_id: string;
+      revision: number;
+      archive_hash: string;
+      prev_archive_hash: string | null;
+      record_count: number;
+      created_at: number;
+    }
+  >;
+  private readonly allCheckpointsStatement: Database.Statement<
+    [string],
+    {
+      checkpoint_id: string;
+      revision: number;
+      archive_hash: string;
+      prev_archive_hash: string | null;
+      record_count: number;
+      created_at: number;
+    }
+  >;
+  private readonly compactionStateStatement: Database.Statement<
+    [string],
+    {
+      compacted_through_revision: number;
+      baseline_revision: number;
+      last_checkpoint_id: string | null;
+      last_compacted_at: number | null;
+      total_revisions_removed: number;
+      total_events_removed: number;
+      total_corrections_removed: number;
+      total_leases_removed: number;
+    }
+  >;
+  private readonly deleteRevisionsBeforeStatement: Database.Statement<
+    [string, number],
+    unknown
+  >;
+  private readonly deleteStaleEventsBeforeStatement: Database.Statement<
+    [string, number, number],
+    unknown
+  >;
+  private readonly deleteSupersededCorrectionsBeforeStatement: Database.Statement<
+    [],
+    unknown
+  >;
+  private readonly deleteReleasedLeasesBeforeStatement: Database.Statement<
+    [string, number],
+    unknown
+  >;
+  private readonly upsertCompactionStateStatement: Database.Statement<
+    [
+      string,
+      number,
+      number,
+      string | null,
+      number | null,
+      number,
+      number,
+      number,
+      number,
+    ],
+    unknown
+  >;
+  private readonly countRevisionsBeforeStatement: Database.Statement<
+    [string, number],
+    { c: number }
+  >;
+  private readonly countStaleEventsBeforeStatement: Database.Statement<
+    [string, number, number],
+    { c: number }
+  >;
+  private readonly countSupersededCorrectionsBeforeStatement: Database.Statement<
+    [],
+    { c: number }
+  >;
+  private readonly countReleasedLeasesBeforeStatement: Database.Statement<
+    [string, number],
+    { c: number }
   >;
 
   ingest(
@@ -1082,6 +1469,22 @@ export class RecognitionStore implements RecognitionStoreLike {
         this.readTransaction.deferred(() => {
           const row = this.getRevisionStatement.get(sessionId, revision);
           if (!row) {
+            const state = this.compactionStateStatement.get(sessionId);
+            if (state && revision <= state.compacted_through_revision) {
+              const cp = state.last_checkpoint_id
+                ? this.checkpointByIdStatement.get(
+                    sessionId,
+                    state.last_checkpoint_id,
+                  )
+                : undefined;
+              throw new RevisionCompactedError(
+                sessionId,
+                revision,
+                state.compacted_through_revision,
+                state.baseline_revision,
+                cp?.checkpoint_id,
+              );
+            }
             throw new RevisionNotFoundError(sessionId, revision);
           }
           return mapRevision(sessionId, row);
@@ -1102,12 +1505,39 @@ export class RecognitionStore implements RecognitionStoreLike {
 
     return withBusyRetry(
       () =>
-        this.readTransaction.deferred(() => {
-          const current =
-            this.cursorStatement.get(sessionId, consumerId)?.cursor ?? 0;
-          const rows = this.changesStatement.all(sessionId, current, limit);
-          return rows.map((row) => mapRevision(sessionId, row));
-        }) as RevisionRecord[],
+        this.db
+          .transaction(() => {
+            const consumer = this.cursorStatement.get(sessionId, consumerId);
+            const current = consumer?.cursor ?? 0;
+            const state = this.compactionStateStatement.get(sessionId);
+            if (state && current < state.baseline_revision) {
+              const resetCheckpointId =
+                consumer?.reset_to_checkpoint ?? state.last_checkpoint_id;
+              const cp = resetCheckpointId
+                ? this.checkpointByIdStatement.get(sessionId, resetCheckpointId)
+                : undefined;
+              if (cp) {
+                throw new ConsumerResetRequiredError(
+                  sessionId,
+                  consumerId,
+                  cp.checkpoint_id,
+                  cp.revision,
+                  cp.archive_hash,
+                );
+              }
+            }
+            const rows = this.changesStatement.all(sessionId, current, limit);
+            if (consumer) {
+              this.touchConsumerStatement.run(
+                this.clock(),
+                consumer.lease_ttl_ms,
+                sessionId,
+                consumerId,
+              );
+            }
+            return rows.map((row) => mapRevision(sessionId, row));
+          })
+          .immediate() as RevisionRecord[],
     );
   }
 
@@ -1138,15 +1568,28 @@ export class RecognitionStore implements RecognitionStoreLike {
     return new SQLiteRevisionConsumer(this, sessionId, consumerId);
   }
 
-  exportArchive(sessionId: string): SessionArchiveStream {
+  exportArchive(
+    sessionId: string,
+    options?: ExportArchiveOptions,
+  ): SessionArchiveStream {
     assertNonEmptyString(sessionId, "sessionId");
-    return exportSessionArchive(this.db, sessionId, this.clock);
+    return exportSessionArchive(this.db, sessionId, this.clock, options);
   }
 
-  async writeArchive(sessionId: string, outputPath: string): Promise<void> {
+  async writeArchive(
+    sessionId: string,
+    outputPath: string,
+    options?: ExportArchiveOptions,
+  ): Promise<void> {
     assertNonEmptyString(sessionId, "sessionId");
     assertNonEmptyString(outputPath, "outputPath");
-    await writeSessionArchive(this.db, sessionId, outputPath, this.clock);
+    await writeSessionArchive(
+      this.db,
+      sessionId,
+      outputPath,
+      this.clock,
+      options,
+    );
   }
 
   async importArchive(
@@ -1166,6 +1609,338 @@ export class RecognitionStore implements RecognitionStoreLike {
     assertNonEmptyString(sessionId, "sessionId");
     assertNonEmptyString(inputPath, "inputPath");
     return importSessionArchiveFile(this.db, sessionId, inputPath, options);
+  }
+
+  registerCheckpoint(
+    sessionId: string,
+    input: RegisterCheckpointInput,
+  ): ArchiveCheckpoint {
+    assertNonEmptyString(sessionId, "sessionId");
+    if (!Number.isSafeInteger(input.revision) || input.revision <= 0) {
+      throw new RecognitionStoreError(
+        "checkpoint revision must be a positive safe integer.",
+      );
+    }
+    assertNonEmptyString(input.archiveHash, "archiveHash");
+    if (!Number.isSafeInteger(input.recordCount) || input.recordCount < 0) {
+      throw new RecognitionStoreError(
+        "checkpoint recordCount must be a non-negative safe integer.",
+      );
+    }
+    const checkpointId =
+      input.checkpointId && input.checkpointId.length > 0
+        ? input.checkpointId
+        : randomUUID();
+
+    return withBusyRetry(() => {
+      let existing:
+        | {
+            checkpoint_id: string;
+            revision: number;
+            archive_hash: string;
+            prev_archive_hash: string | null;
+            record_count: number;
+            created_at: number;
+          }
+        | undefined;
+      this.db
+        .transaction(() => {
+          existing = this.checkpointByIdStatement.get(sessionId, checkpointId);
+          if (existing) return;
+          this.insertCheckpointStatement.run(
+            sessionId,
+            checkpointId,
+            input.revision,
+            input.archiveHash,
+            input.prevArchiveHash ?? null,
+            input.recordCount,
+            this.clock(),
+          );
+        })
+        .immediate();
+      return this.mapCheckpoint(
+        this.checkpointByIdStatement.get(sessionId, checkpointId) as {
+          checkpoint_id: string;
+          revision: number;
+          archive_hash: string;
+          prev_archive_hash: string | null;
+          record_count: number;
+          created_at: number;
+        },
+        sessionId,
+      );
+    });
+  }
+
+  getCheckpoint(
+    sessionId: string,
+    checkpointId: string,
+  ): ArchiveCheckpoint | undefined {
+    assertNonEmptyString(sessionId, "sessionId");
+    assertNonEmptyString(checkpointId, "checkpointId");
+    const row = this.checkpointByIdStatement.get(sessionId, checkpointId);
+    return row ? this.mapCheckpoint(row, sessionId) : undefined;
+  }
+
+  getCheckpoints(sessionId: string): ArchiveCheckpoint[] {
+    assertNonEmptyString(sessionId, "sessionId");
+    return this.allCheckpointsStatement
+      .all(sessionId)
+      .map((row) => this.mapCheckpoint(row, sessionId));
+  }
+
+  getCompactionState(sessionId: string): CompactionState {
+    assertNonEmptyString(sessionId, "sessionId");
+    const row = this.compactionStateStatement.get(sessionId);
+    return {
+      sessionId,
+      compactedThroughRevision: row?.compacted_through_revision ?? 0,
+      baselineRevision: row?.baseline_revision ?? 0,
+      ...(row?.last_checkpoint_id
+        ? { lastCheckpointId: row.last_checkpoint_id }
+        : {}),
+      ...(row?.last_compacted_at
+        ? { lastCompactedAt: row.last_compacted_at }
+        : {}),
+      totalRevisionsRemoved: row?.total_revisions_removed ?? 0,
+      totalEventsRemoved: row?.total_events_removed ?? 0,
+      totalCorrectionsRemoved: row?.total_corrections_removed ?? 0,
+      totalLeasesRemoved: row?.total_leases_removed ?? 0,
+    };
+  }
+
+  touchConsumerLease(
+    sessionId: string,
+    consumerId: string,
+    ttlMs?: number,
+  ): number {
+    assertNonEmptyString(sessionId, "sessionId");
+    assertNonEmptyString(consumerId, "consumerId");
+    if (ttlMs !== undefined) {
+      if (!Number.isSafeInteger(ttlMs) || ttlMs <= 0) {
+        throw new RecognitionStoreError(
+          "ttlMs must be a positive safe integer.",
+        );
+      }
+    }
+    return withBusyRetry(() => {
+      const now = this.clock();
+      const existing = this.cursorStatement.get(sessionId, consumerId);
+      const ttl = ttlMs ?? existing?.lease_ttl_ms ?? 86400000;
+      if (!existing) {
+        this.ensureConsumerStatement.run(sessionId, consumerId, now, ttl, now);
+      } else {
+        this.touchConsumerStatement.run(now, ttl, sessionId, consumerId);
+      }
+      return now + ttl;
+    });
+  }
+
+  resetConsumerToCheckpoint(
+    sessionId: string,
+    consumerId: string,
+    checkpointId: string,
+  ): number {
+    assertNonEmptyString(sessionId, "sessionId");
+    assertNonEmptyString(consumerId, "consumerId");
+    assertNonEmptyString(checkpointId, "checkpointId");
+    return withBusyRetry(() => {
+      let newCursor = 0;
+      this.db
+        .transaction(() => {
+          const cp = this.checkpointByIdStatement.get(sessionId, checkpointId);
+          if (!cp) {
+            throw new RecognitionStoreError(
+              `Checkpoint ${checkpointId} does not exist in session ${sessionId}.`,
+            );
+          }
+          const now = this.clock();
+          const existing = this.cursorStatement.get(sessionId, consumerId);
+          const ttl = existing?.lease_ttl_ms ?? 86400000;
+          this.ensureConsumerStatement.run(
+            sessionId,
+            consumerId,
+            now,
+            ttl,
+            now,
+          );
+          newCursor = cp.revision;
+          this.resetCursorToCheckpointStatement.run(
+            cp.revision,
+            null,
+            now,
+            now,
+            sessionId,
+            consumerId,
+          );
+        })
+        .immediate();
+      return newCursor;
+    });
+  }
+
+  compact(sessionId: string, options: CompactOptions = {}): CompactionResult {
+    assertNonEmptyString(sessionId, "sessionId");
+    return withBusyRetry(() => {
+      const before = this.getCompactionState(sessionId);
+      let result!: CompactionResult;
+      this.db
+        .transaction(() => {
+          const checkpointRow = options.checkpointId
+            ? this.checkpointByIdStatement.get(sessionId, options.checkpointId)
+            : this.latestCheckpointStatement.get(sessionId);
+
+          if (!checkpointRow) {
+            result = {
+              sessionId,
+              compacted: false,
+              skipped: "no-checkpoint",
+              safeWatermark: 0,
+              checkpointRevision: 0,
+              checkpointId: "",
+              before,
+              after: before,
+              removed: {
+                revisionsRemoved: 0,
+                eventsRemoved: 0,
+                correctionsRemoved: 0,
+                leasesRemoved: 0,
+              },
+            };
+            return;
+          }
+
+          const now = this.clock();
+          const activeConsumers = this.activeConsumersStatement.all(
+            sessionId,
+            now,
+          );
+
+          let minCursor = checkpointRow.revision;
+          for (const c of activeConsumers) {
+            if (c.cursor < minCursor) minCursor = c.cursor;
+          }
+
+          const safeWatermark = Math.min(checkpointRow.revision, minCursor);
+
+          if (safeWatermark <= before.compactedThroughRevision) {
+            result = {
+              sessionId,
+              compacted: false,
+              skipped: "nothing-to-compact",
+              safeWatermark,
+              checkpointRevision: checkpointRow.revision,
+              checkpointId: checkpointRow.checkpoint_id,
+              before,
+              after: before,
+              removed: {
+                revisionsRemoved: 0,
+                eventsRemoved: 0,
+                correctionsRemoved: 0,
+                leasesRemoved: 0,
+              },
+            };
+            return;
+          }
+
+          const revisionsRemoved = (
+            this.countRevisionsBeforeStatement.get(
+              sessionId,
+              safeWatermark,
+            ) as { c: number }
+          ).c;
+          const eventsRemoved = (
+            this.countStaleEventsBeforeStatement.get(
+              sessionId,
+              safeWatermark,
+              safeWatermark,
+            ) as { c: number }
+          ).c;
+          const correctionsRemoved = (
+            this.countSupersededCorrectionsBeforeStatement.get() as {
+              c: number;
+            }
+          ).c;
+          const leasesRemoved = (
+            this.countReleasedLeasesBeforeStatement.get(
+              sessionId,
+              checkpointRow.created_at,
+            ) as { c: number }
+          ).c;
+
+          if (!options.dryRun) {
+            this.deleteStaleEventsBeforeStatement.run(
+              sessionId,
+              safeWatermark,
+              safeWatermark,
+            );
+            this.deleteSupersededCorrectionsBeforeStatement.run();
+            this.deleteReleasedLeasesBeforeStatement.run(
+              sessionId,
+              checkpointRow.created_at,
+            );
+            this.deleteRevisionsBeforeStatement.run(sessionId, safeWatermark);
+
+            this.upsertCompactionStateStatement.run(
+              sessionId,
+              safeWatermark,
+              safeWatermark,
+              checkpointRow.checkpoint_id,
+              now,
+              revisionsRemoved,
+              eventsRemoved,
+              correctionsRemoved,
+              leasesRemoved,
+            );
+          }
+
+          const after = options.dryRun
+            ? before
+            : this.getCompactionState(sessionId);
+
+          result = {
+            sessionId,
+            compacted: !options.dryRun,
+            safeWatermark,
+            checkpointRevision: checkpointRow.revision,
+            checkpointId: checkpointRow.checkpoint_id,
+            before,
+            after,
+            removed: {
+              revisionsRemoved,
+              eventsRemoved,
+              correctionsRemoved,
+              leasesRemoved,
+            },
+          };
+        })
+        .immediate();
+      return result;
+    });
+  }
+
+  private mapCheckpoint(
+    row: {
+      checkpoint_id: string;
+      revision: number;
+      archive_hash: string;
+      prev_archive_hash: string | null;
+      record_count: number;
+      created_at: number;
+    },
+    sessionId: string,
+  ): ArchiveCheckpoint {
+    return {
+      sessionId,
+      checkpointId: row.checkpoint_id,
+      revision: row.revision,
+      archiveHash: row.archive_hash,
+      ...(row.prev_archive_hash === null
+        ? {}
+        : { prevArchiveHash: row.prev_archive_hash }),
+      recordCount: row.record_count,
+      createdAt: row.created_at,
+    };
   }
 
   close(): void {

@@ -3,6 +3,7 @@ import type {
   ArchiveImportResult,
   SessionArchiveStream,
 } from "./archive-types";
+import type { ExportArchiveOptions } from "./archive";
 
 export interface RecognitionEventInput {
   eventId: string;
@@ -180,8 +181,15 @@ export interface RecognitionStore {
     sourceSeq: number,
   ): CorrectionRecord[];
 
-  exportArchive(sessionId: string): SessionArchiveStream;
-  writeArchive(sessionId: string, outputPath: string): Promise<void>;
+  exportArchive(
+    sessionId: string,
+    options?: ExportArchiveOptions,
+  ): SessionArchiveStream;
+  writeArchive(
+    sessionId: string,
+    outputPath: string,
+    options?: ExportArchiveOptions,
+  ): Promise<void>;
   importArchive(
     sessionId: string,
     stream: Readable,
@@ -193,7 +201,87 @@ export interface RecognitionStore {
     options?: { injectFailureAfterRecords?: number },
   ): Promise<ArchiveImportResult>;
 
+  registerCheckpoint(
+    sessionId: string,
+    input: RegisterCheckpointInput,
+  ): ArchiveCheckpoint;
+  getCheckpoints(sessionId: string): ArchiveCheckpoint[];
+  getCheckpoint(
+    sessionId: string,
+    checkpointId: string,
+  ): ArchiveCheckpoint | undefined;
+  compact(sessionId: string, options?: CompactOptions): CompactionResult;
+  getCompactionState(sessionId: string): CompactionState;
+  resetConsumerToCheckpoint(
+    sessionId: string,
+    consumerId: string,
+    checkpointId: string,
+  ): number;
+  touchConsumerLease(
+    sessionId: string,
+    consumerId: string,
+    ttlMs?: number,
+  ): number;
+
   close(): void;
+}
+
+export interface ArchiveCheckpoint {
+  checkpointId: string;
+  sessionId: string;
+  revision: number;
+  archiveHash: string;
+  prevArchiveHash?: string;
+  recordCount: number;
+  createdAt: number;
+}
+
+export interface RegisterCheckpointInput {
+  checkpointId?: string;
+  revision: number;
+  archiveHash: string;
+  prevArchiveHash?: string;
+  recordCount: number;
+}
+
+export interface CompactOptions {
+  checkpointId?: string;
+  dryRun?: boolean;
+}
+
+export interface CompactionStats {
+  revisionsRemoved: number;
+  eventsRemoved: number;
+  correctionsRemoved: number;
+  leasesRemoved: number;
+}
+
+export interface CompactionResult {
+  sessionId: string;
+  compacted: boolean;
+  skipped?:
+    | "no-checkpoint"
+    | "no-active-consumers"
+    | "active-consumer-behind-checkpoint"
+    | "nothing-to-compact";
+  safeWatermark: number;
+  checkpointRevision: number;
+  checkpointId: string;
+  before: CompactionState;
+  after: CompactionState;
+  removed: CompactionStats;
+}
+
+export interface CompactionState {
+  sessionId: string;
+  compactedThroughRevision: number;
+  baselineRevision: number;
+  lastCheckpointId?: string;
+  lastCompactedAt?: number;
+  totalRevisionsRemoved: number;
+  totalEventsRemoved: number;
+  totalCorrectionsRemoved: number;
+  totalLeasesRemoved: number;
 }
 
 export interface RevisionConsumer {
@@ -202,4 +290,6 @@ export interface RevisionConsumer {
   fetch(limit?: number): RevisionRecord[];
   acknowledge(revision: number): number;
   getCursor(): number;
+  resetToCheckpoint(checkpointId: string): number;
+  heartbeat(ttlMs?: number): number;
 }

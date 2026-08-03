@@ -73,3 +73,72 @@ export class ReviewConflictError extends RecognitionStoreError {
     this.actualRevision = details?.actualRevision;
   }
 }
+
+export class RevisionCompactedError extends RecognitionStoreError {
+  public readonly sessionId: string;
+  public readonly requestedRevision: number;
+  public readonly compactedThroughRevision: number;
+  public readonly baselineRevision: number;
+  public readonly checkpointId?: string;
+
+  constructor(
+    sessionId: string,
+    requestedRevision: number,
+    compactedThroughRevision: number,
+    baselineRevision: number,
+    checkpointId?: string,
+  ) {
+    super(
+      `Revision ${requestedRevision} in session ${sessionId} has been compacted; the earliest available revision is ${baselineRevision}.`,
+    );
+    this.name = "RevisionCompactedError";
+    this.sessionId = sessionId;
+    this.requestedRevision = requestedRevision;
+    this.compactedThroughRevision = compactedThroughRevision;
+    this.baselineRevision = baselineRevision;
+    this.checkpointId = checkpointId;
+  }
+}
+
+export class ConsumerResetRequiredError extends RecognitionStoreError {
+  public readonly sessionId: string;
+  public readonly consumerId: string;
+  public readonly checkpointId: string;
+  public readonly checkpointRevision: number;
+  public readonly archiveHash: string;
+
+  constructor(
+    sessionId: string,
+    consumerId: string,
+    checkpointId: string,
+    checkpointRevision: number,
+    archiveHash: string,
+  ) {
+    super(
+      `Consumer ${consumerId} in session ${sessionId} must reset to checkpoint ${checkpointId} at revision ${checkpointRevision} before resuming.`,
+    );
+    this.name = "ConsumerResetRequiredError";
+    this.sessionId = sessionId;
+    this.consumerId = consumerId;
+    this.checkpointId = checkpointId;
+    this.checkpointRevision = checkpointRevision;
+    this.archiveHash = archiveHash;
+  }
+}
+
+export type CompactionSkipReason =
+  | "no-checkpoint"
+  | "no-active-consumers"
+  | "active-consumer-behind-checkpoint"
+  | "nothing-to-compact";
+
+export class CompactionSkippedError extends RecognitionStoreError {
+  public readonly reason: CompactionSkipReason;
+
+  constructor(reason: CompactionSkipReason, message: string) {
+    super(message);
+    this.name = "CompactionSkippedError";
+    this.reason = reason;
+  }
+}
+

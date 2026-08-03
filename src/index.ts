@@ -4,11 +4,15 @@ export {
   type RecognitionStoreOptions,
 } from "./store";
 export {
+  CompactionSkippedError,
+  ConsumerResetRequiredError,
   EventConflictError,
   InvalidEventError,
   RecognitionStoreError,
   ReviewConflictError,
+  RevisionCompactedError,
   RevisionNotFoundError,
+  type CompactionSkipReason,
   type EventConflictReason,
   type ReviewConflictReason,
 } from "./errors";

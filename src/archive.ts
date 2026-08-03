@@ -12,6 +12,8 @@ import {
 import {
   ARCHIVE_FORMAT_VERSION,
   ARCHIVE_MAGIC,
+  type ArchiveCheckpointRecord,
+  type ArchiveCompactionStateRecord,
   type ArchiveCorrectionRecord,
   type ArchiveCursorRecord,
   type ArchiveDataRecord,
@@ -106,6 +108,9 @@ interface CursorExportRow {
   consumer_id: string;
   cursor: number;
   updated_at: number;
+  lease_ttl_ms: number;
+  last_seen_at: number;
+  reset_to_checkpoint: string | null;
 }
 
 interface ExtrasRow {
@@ -120,12 +125,41 @@ interface UnknownRow {
   payload: string;
 }
 
+interface CheckpointExportRow {
+  checkpoint_id: string;
+  revision: number;
+  archive_hash: string;
+  prev_archive_hash: string | null;
+  record_count: number;
+  created_at: number;
+}
+
+interface CompactionStateRow {
+  compacted_through_revision: number;
+  baseline_revision: number;
+  last_checkpoint_id: string | null;
+  last_compacted_at: number | null;
+  total_revisions_removed: number;
+  total_events_removed: number;
+  total_corrections_removed: number;
+  total_leases_removed: number;
+}
+
+export interface ExportArchiveOptions {
+  checkpointId?: string;
+  prevArchiveHash?: string;
+  baseCheckpointId?: string;
+  fromRevision?: number;
+}
+
 const KNOWN_TYPES = new Set([
   "event",
   "revision",
   "correction",
   "lease",
   "cursor",
+  "checkpoint",
+  "compaction",
 ]);
 
 function stableStringify(value: unknown): string {
@@ -158,7 +192,8 @@ function hashLines(lines: string[], algorithm: "sha256"): string {
 export async function* exportSessionArchive(
   db: Database.Database,
   sessionId: string,
-  clock: () => number = Date.now
+  clock: () => number = Date.now,
+  options: ExportArchiveOptions = {},
 ): SessionArchiveStream {
   const events = db
     .prepare<[string], EventRow>(
@@ -198,9 +233,9 @@ export async function* exportSessionArchive(
 
   const cursors = db
     .prepare<[string], CursorExportRow>(
-      `SELECT consumer_id, cursor, updated_at
+      `SELECT consumer_id, cursor, updated_at, lease_ttl_ms, last_seen_at, reset_to_checkpoint
        FROM consumer_cursors WHERE session_id = ?
-       ORDER BY consumer_id ASC`
+       ORDER BY consumer_id ASC`,
     )
     .all(sessionId);
 
@@ -308,12 +343,74 @@ export async function* exportSessionArchive(
       consumerId: row.consumer_id,
       cursor: row.cursor,
       updatedAt: row.updated_at,
+      ...(row.lease_ttl_ms === 86400000
+        ? {}
+        : { leaseTtlMs: row.lease_ttl_ms }),
+      ...(row.last_seen_at === 0 ? {} : { lastSeenAt: row.last_seen_at }),
+      ...(row.reset_to_checkpoint === null ||
+      row.reset_to_checkpoint === undefined
+        ? {}
+        : { resetToCheckpoint: row.reset_to_checkpoint }),
     };
     const extras = extrasMap.get(`cursor\u0000${row.consumer_id}`);
     records.push({
       type: "cursor",
       data: extras ? { ...base, ...extras } : base,
     });
+  }
+
+  const checkpoints = db
+    .prepare<[string], CheckpointExportRow>(
+      `SELECT checkpoint_id, revision, archive_hash, prev_archive_hash,
+              record_count, created_at
+       FROM archive_checkpoints WHERE session_id = ?
+       ORDER BY revision ASC, checkpoint_id ASC`,
+    )
+    .all(sessionId);
+
+  for (const row of checkpoints) {
+    const base: ArchiveCheckpointRecord = {
+      checkpointId: row.checkpoint_id,
+      revision: row.revision,
+      archiveHash: row.archive_hash,
+      ...(row.prev_archive_hash === null
+        ? {}
+        : { prevArchiveHash: row.prev_archive_hash }),
+      recordCount: row.record_count,
+      createdAt: row.created_at,
+    };
+    const extras = extrasMap.get(`checkpoint\u0000${row.checkpoint_id}`);
+    records.push({
+      type: "checkpoint",
+      data: extras ? { ...base, ...extras } : base,
+    });
+  }
+
+  const compactionRow = db
+    .prepare<[string], CompactionStateRow>(
+      `SELECT compacted_through_revision, baseline_revision, last_checkpoint_id,
+              last_compacted_at, total_revisions_removed, total_events_removed,
+              total_corrections_removed, total_leases_removed
+       FROM compaction_state WHERE session_id = ?`,
+    )
+    .get(sessionId);
+
+  if (compactionRow) {
+    const compaction: ArchiveCompactionStateRecord = {
+      compactedThroughRevision: compactionRow.compacted_through_revision,
+      baselineRevision: compactionRow.baseline_revision,
+      ...(compactionRow.last_checkpoint_id === null
+        ? {}
+        : { lastCheckpointId: compactionRow.last_checkpoint_id }),
+      ...(compactionRow.last_compacted_at === null
+        ? {}
+        : { lastCompactedAt: compactionRow.last_compacted_at }),
+      totalRevisionsRemoved: compactionRow.total_revisions_removed,
+      totalEventsRemoved: compactionRow.total_events_removed,
+      totalCorrectionsRemoved: compactionRow.total_corrections_removed,
+      totalLeasesRemoved: compactionRow.total_leases_removed,
+    };
+    records.push({ type: "compaction", data: compaction });
   }
 
   for (const row of unknownRows) {
@@ -335,6 +432,15 @@ export async function* exportSessionArchive(
     recordCount: records.length,
     dataHashAlgorithm: "sha256",
     dataHash,
+    ...(options.prevArchiveHash
+      ? { prevArchiveHash: options.prevArchiveHash }
+      : {}),
+    ...(options.baseCheckpointId
+      ? { baseCheckpointId: options.baseCheckpointId }
+      : {}),
+    ...(options.checkpointId
+      ? { checkpointId: options.checkpointId }
+      : {}),
   };
 
   yield stableStringify(header) + "\n";
@@ -355,11 +461,12 @@ export async function writeSessionArchive(
   db: Database.Database,
   sessionId: string,
   outputPath: string,
-  clock: () => number = Date.now
+  clock: () => number = Date.now,
+  options: ExportArchiveOptions = {},
 ): Promise<void> {
   const writeStream = createWriteStream(outputPath);
   try {
-    for await (const chunk of exportSessionArchive(db, sessionId, clock)) {
+    for await (const chunk of exportSessionArchive(db, sessionId, clock, options)) {
       if (!writeStream.write(chunk)) {
         await new Promise<void>((resolve, reject) =>
           writeStream.once("drain", resolve).once("error", reject)
@@ -664,11 +771,18 @@ function validateLease(rec: ArchiveDataRecord): ArchiveLeaseRecord {
 function validateCursor(rec: ArchiveDataRecord): ArchiveCursorRecord {
   assertObject(rec.data, "cursor data");
   const data = rec.data;
-  return {
+  const result: ArchiveCursorRecord = {
     consumerId: assertString(data.consumerId, "consumerId"),
     cursor: assertInteger(data.cursor, "cursor"),
     updatedAt: assertInteger(data.updatedAt, "updatedAt"),
   };
+  if (Number.isSafeInteger(data.leaseTtlMs))
+    result.leaseTtlMs = data.leaseTtlMs as number;
+  if (Number.isSafeInteger(data.lastSeenAt))
+    result.lastSeenAt = data.lastSeenAt as number;
+  if (typeof data.resetToCheckpoint === "string")
+    result.resetToCheckpoint = data.resetToCheckpoint;
+  return result;
 }
 
 const EVENT_KNOWN = new Set([
@@ -714,7 +828,32 @@ const LEASE_KNOWN = new Set([
   "expiresAt",
   "releasedAt",
 ]);
-const CURSOR_KNOWN = new Set(["consumerId", "cursor", "updatedAt"]);
+const CURSOR_KNOWN = new Set([
+  "consumerId",
+  "cursor",
+  "updatedAt",
+  "leaseTtlMs",
+  "lastSeenAt",
+  "resetToCheckpoint",
+]);
+const CHECKPOINT_KNOWN = new Set([
+  "checkpointId",
+  "revision",
+  "archiveHash",
+  "prevArchiveHash",
+  "recordCount",
+  "createdAt",
+]);
+const COMPACTION_KNOWN = new Set([
+  "compactedThroughRevision",
+  "baselineRevision",
+  "lastCheckpointId",
+  "lastCompactedAt",
+  "totalRevisionsRemoved",
+  "totalEventsRemoved",
+  "totalCorrectionsRemoved",
+  "totalLeasesRemoved",
+]);
 
 export interface ImportSessionArchiveOptions {
   injectFailureAfterRecords?: number;
@@ -749,13 +888,15 @@ async function importSessionArchiveInternal(
     );
   }
 
-  let revision = 1;
+  let expectedRevision = 1;
 
   const events: ArchiveEventRecord[] = [];
   const revisions: ArchiveRevisionRecord[] = [];
   const corrections: ArchiveCorrectionRecord[] = [];
   const leases: ArchiveLeaseRecord[] = [];
   const cursors: ArchiveCursorRecord[] = [];
+  const checkpoints: ArchiveCheckpointRecord[] = [];
+  let compaction: ArchiveCompactionStateRecord | undefined;
   const unknown: Array<{ type: string; payload: Record<string, unknown>; seq: number }> = [];
 
   const extrasToWrite: Array<{
@@ -787,13 +928,6 @@ async function importSessionArchiveInternal(
       if (extras) extrasToWrite.push({ table: "event", key: event.eventId, extras });
     } else if (record.type === "revision") {
       const rev = validateRevision(record);
-      if (rev.revision !== revision) {
-        throw new ArchiveIntegrityError(
-          "reorder",
-          `Revisions must be contiguous; expected ${revision}, got ${rev.revision}.`
-        );
-      }
-      revision += 1;
       revisions.push(rev);
       const extras = pickExtras(
         record.data as Record<string, unknown>,
@@ -844,6 +978,78 @@ async function importSessionArchiveInternal(
           key: cursor.consumerId,
           extras,
         });
+    } else if (record.type === "checkpoint") {
+      assertObject(record.data, "checkpoint data");
+      const data = record.data;
+      const cp: ArchiveCheckpointRecord = {
+        checkpointId: assertString(data.checkpointId, "checkpointId"),
+        revision: assertInteger(data.revision, "revision"),
+        archiveHash: assertString(data.archiveHash, "archiveHash"),
+        recordCount: assertInteger(data.recordCount, "recordCount"),
+        createdAt: assertInteger(data.createdAt, "createdAt"),
+        ...(typeof data.prevArchiveHash === "string"
+          ? { prevArchiveHash: data.prevArchiveHash }
+          : {}),
+      };
+      checkpoints.push(cp);
+      const extras = pickExtras(
+        record.data as Record<string, unknown>,
+        CHECKPOINT_KNOWN
+      );
+      if (extras)
+        extrasToWrite.push({
+          table: "checkpoint",
+          key: cp.checkpointId,
+          extras,
+        });
+    } else if (record.type === "compaction") {
+      if (compaction) {
+        throw new ArchiveIntegrityError(
+          "bad-header",
+          "Archive contains multiple compaction state records.",
+        );
+      }
+      assertObject(record.data, "compaction data");
+      const data = record.data;
+      compaction = {
+        compactedThroughRevision: assertInteger(
+          data.compactedThroughRevision,
+          "compactedThroughRevision",
+        ),
+        baselineRevision: assertInteger(data.baselineRevision, "baselineRevision"),
+        totalRevisionsRemoved: assertInteger(
+          data.totalRevisionsRemoved,
+          "totalRevisionsRemoved",
+        ),
+        totalEventsRemoved: assertInteger(
+          data.totalEventsRemoved,
+          "totalEventsRemoved",
+        ),
+        totalCorrectionsRemoved: assertInteger(
+          data.totalCorrectionsRemoved,
+          "totalCorrectionsRemoved",
+        ),
+        totalLeasesRemoved: assertInteger(
+          data.totalLeasesRemoved,
+          "totalLeasesRemoved",
+        ),
+        ...(typeof data.lastCheckpointId === "string"
+          ? { lastCheckpointId: data.lastCheckpointId }
+          : {}),
+        ...(Number.isSafeInteger(data.lastCompactedAt)
+          ? { lastCompactedAt: data.lastCompactedAt as number }
+          : {}),
+      };
+      const extras = pickExtras(
+        record.data as Record<string, unknown>,
+        COMPACTION_KNOWN
+      );
+      if (extras)
+        extrasToWrite.push({
+          table: "compaction",
+          key: "state",
+          extras,
+        });
     } else if (!KNOWN_TYPES.has(record.type)) {
       assertObject(record.data, `unknown ${record.type} data`);
       unknown.push({
@@ -857,6 +1063,19 @@ async function importSessionArchiveInternal(
         `Unknown record type: ${record.type}.`
       );
     }
+  }
+
+  if (compaction) {
+    expectedRevision = compaction.baselineRevision + 1;
+  }
+  for (const rev of revisions) {
+    if (rev.revision !== expectedRevision) {
+      throw new ArchiveIntegrityError(
+        "reorder",
+        `Revisions must be contiguous; expected ${expectedRevision}, got ${rev.revision}.`
+      );
+    }
+    expectedRevision += 1;
   }
 
   // Validate referential integrity before writing anything.
@@ -969,6 +1188,7 @@ async function importSessionArchiveInternal(
       corrections: 0,
       leases: 0,
       cursors: 0,
+      checkpoints: 0,
       unknown: 0,
     },
     duplicates: {
@@ -977,6 +1197,7 @@ async function importSessionArchiveInternal(
       corrections: 0,
       leases: 0,
       cursors: 0,
+      checkpoints: 0,
     },
     conflicting: 0,
   };
@@ -1013,11 +1234,38 @@ async function importSessionArchiveInternal(
        released_at = excluded.released_at`
   );
   const upsertCursor = db.prepare(
-    `INSERT INTO consumer_cursors(session_id, consumer_id, cursor, updated_at)
-     VALUES(?, ?, ?, ?)
+    `INSERT INTO consumer_cursors(
+       session_id, consumer_id, cursor, updated_at, lease_ttl_ms,
+       last_seen_at, reset_to_checkpoint
+     ) VALUES(?, ?, ?, ?, ?, ?, ?)
      ON CONFLICT(session_id, consumer_id) DO UPDATE SET
        cursor = excluded.cursor,
-       updated_at = excluded.updated_at`
+       updated_at = excluded.updated_at,
+       lease_ttl_ms = excluded.lease_ttl_ms,
+       last_seen_at = excluded.last_seen_at,
+       reset_to_checkpoint = excluded.reset_to_checkpoint`,
+  );
+  const insertCheckpoint = db.prepare(
+    `INSERT OR IGNORE INTO archive_checkpoints(
+       session_id, checkpoint_id, revision, archive_hash, prev_archive_hash,
+       record_count, created_at
+     ) VALUES(?, ?, ?, ?, ?, ?, ?)`,
+  );
+  const upsertCompaction = db.prepare(
+    `INSERT INTO compaction_state(
+       session_id, compacted_through_revision, baseline_revision,
+       last_checkpoint_id, last_compacted_at, total_revisions_removed,
+       total_events_removed, total_corrections_removed, total_leases_removed
+     ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)
+     ON CONFLICT(session_id) DO UPDATE SET
+       compacted_through_revision = excluded.compacted_through_revision,
+       baseline_revision = excluded.baseline_revision,
+       last_checkpoint_id = excluded.last_checkpoint_id,
+       last_compacted_at = excluded.last_compacted_at,
+       total_revisions_removed = excluded.total_revisions_removed,
+       total_events_removed = excluded.total_events_removed,
+       total_corrections_removed = excluded.total_corrections_removed,
+       total_leases_removed = excluded.total_leases_removed`,
   );
   const insertExtras = db.prepare(
     `INSERT OR REPLACE INTO archive_extras(session_id, record_table, record_key, extras)
@@ -1106,17 +1354,48 @@ async function importSessionArchiveInternal(
       const before = db
         .prepare<[string, string], { cursor: number }>(
           `SELECT cursor FROM consumer_cursors
-           WHERE session_id = ? AND consumer_id = ?`
+           WHERE session_id = ? AND consumer_id = ?`,
         )
         .get(targetSessionId, cursor.consumerId);
       upsertCursor.run(
         targetSessionId,
         cursor.consumerId,
         cursor.cursor,
-        cursor.updatedAt
+        cursor.updatedAt,
+        cursor.leaseTtlMs ?? 86400000,
+        cursor.lastSeenAt ?? 0,
+        cursor.resetToCheckpoint ?? null,
       );
       if (before) result.duplicates.cursors += 1;
       else result.imported.cursors += 1;
+    }
+
+    for (const cp of checkpoints) {
+      const info = insertCheckpoint.run(
+        targetSessionId,
+        cp.checkpointId,
+        cp.revision,
+        cp.archiveHash,
+        cp.prevArchiveHash ?? null,
+        cp.recordCount,
+        cp.createdAt,
+      );
+      if (info.changes > 0) result.imported.checkpoints += 1;
+      else result.duplicates.checkpoints += 1;
+    }
+
+    if (compaction) {
+      upsertCompaction.run(
+        targetSessionId,
+        compaction.compactedThroughRevision,
+        compaction.baselineRevision,
+        compaction.lastCheckpointId ?? null,
+        compaction.lastCompactedAt ?? null,
+        compaction.totalRevisionsRemoved,
+        compaction.totalEventsRemoved,
+        compaction.totalCorrectionsRemoved,
+        compaction.totalLeasesRemoved,
+      );
     }
 
     for (const extra of extrasToWrite) {

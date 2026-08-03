@@ -1,6 +1,6 @@
 import type Database from "better-sqlite3";
 
-export const SCHEMA_VERSION = 3;
+export const SCHEMA_VERSION = 4;
 
 export const SCHEMA_SQL = `
 CREATE TABLE IF NOT EXISTS events (
@@ -45,6 +45,9 @@ CREATE TABLE IF NOT EXISTS consumer_cursors (
   consumer_id TEXT NOT NULL,
   cursor INTEGER NOT NULL DEFAULT 0,
   updated_at INTEGER NOT NULL,
+  lease_ttl_ms INTEGER NOT NULL DEFAULT 86400000,
+  last_seen_at INTEGER NOT NULL DEFAULT 0,
+  reset_to_checkpoint TEXT,
   PRIMARY KEY(session_id, consumer_id)
 );
 
@@ -103,17 +106,49 @@ CREATE TABLE IF NOT EXISTS archive_unknown_records (
   payload TEXT NOT NULL,
   PRIMARY KEY(session_id, seq)
 );
+
+CREATE TABLE IF NOT EXISTS archive_checkpoints (
+  session_id TEXT NOT NULL,
+  checkpoint_id TEXT NOT NULL,
+  revision INTEGER NOT NULL,
+  archive_hash TEXT NOT NULL,
+  prev_archive_hash TEXT,
+  record_count INTEGER NOT NULL,
+  created_at INTEGER NOT NULL,
+  PRIMARY KEY(session_id, checkpoint_id)
+);
+
+CREATE TABLE IF NOT EXISTS compaction_state (
+  session_id TEXT NOT NULL PRIMARY KEY,
+  compacted_through_revision INTEGER NOT NULL DEFAULT 0,
+  baseline_revision INTEGER NOT NULL DEFAULT 0,
+  last_checkpoint_id TEXT,
+  last_compacted_at INTEGER,
+  total_revisions_removed INTEGER NOT NULL DEFAULT 0,
+  total_events_removed INTEGER NOT NULL DEFAULT 0,
+  total_corrections_removed INTEGER NOT NULL DEFAULT 0,
+  total_leases_removed INTEGER NOT NULL DEFAULT 0
+);
 `;
 
 function hasColumn(
   db: Database.Database,
   table: string,
-  column: string
+  column: string,
 ): boolean {
   const rows = db.prepare(`PRAGMA table_info(${table})`).all() as Array<{
     name: string;
   }>;
   return rows.some((row) => row.name === column);
+}
+
+function tableExists(db: Database.Database, table: string): boolean {
+  const row = db
+    .prepare(
+      `SELECT 1 AS exists_flag FROM sqlite_master WHERE type = 'table' AND name = ?`,
+    )
+    .get(table) as { exists_flag: number } | undefined;
+  return Boolean(row?.exists_flag);
 }
 
 export function initializeSchema(db: Database.Database): void {
@@ -128,15 +163,47 @@ export function initializeSchema(db: Database.Database): void {
     if (current < 2) {
       if (!hasColumn(db, "revisions", "change_type")) {
         db.exec(
-          `ALTER TABLE revisions ADD COLUMN change_type TEXT NOT NULL DEFAULT 'event' CHECK(change_type IN ('event', 'correction'))`
+          `ALTER TABLE revisions ADD COLUMN change_type TEXT NOT NULL DEFAULT 'event' CHECK(change_type IN ('event', 'correction'))`,
         );
       }
       if (!hasColumn(db, "revisions", "correction_id")) {
         db.exec(`ALTER TABLE revisions ADD COLUMN correction_id TEXT`);
       }
       db.exec(
-        `CREATE INDEX IF NOT EXISTS idx_revisions_correction ON revisions(session_id, correction_id)`
+        `CREATE INDEX IF NOT EXISTS idx_revisions_correction ON revisions(session_id, correction_id)`,
       );
+    }
+
+    if (current < 3) {
+      // v3 tables are created by SCHEMA_SQL above.
+    }
+
+    if (current < 4) {
+      if (tableExists(db, "consumer_cursors")) {
+        if (!hasColumn(db, "consumer_cursors", "lease_ttl_ms")) {
+          db.exec(
+            `ALTER TABLE consumer_cursors ADD COLUMN lease_ttl_ms INTEGER NOT NULL DEFAULT 86400000`,
+          );
+        }
+        if (!hasColumn(db, "consumer_cursors", "last_seen_at")) {
+          db.exec(
+            `ALTER TABLE consumer_cursors ADD COLUMN last_seen_at INTEGER NOT NULL DEFAULT 0`,
+          );
+        }
+        if (!hasColumn(db, "consumer_cursors", "reset_to_checkpoint")) {
+          db.exec(
+            `ALTER TABLE consumer_cursors ADD COLUMN reset_to_checkpoint TEXT`,
+          );
+        }
+      }
+      if (
+        tableExists(db, "compaction_state") &&
+        !hasColumn(db, "compaction_state", "total_leases_removed")
+      ) {
+        db.exec(
+          `ALTER TABLE compaction_state ADD COLUMN total_leases_removed INTEGER NOT NULL DEFAULT 0`,
+        );
+      }
     }
   }).immediate();
 

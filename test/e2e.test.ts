@@ -69,9 +69,7 @@ function removePath(path: string): void {
   }
 }
 
-async function killProcess(
-  child: ReturnType<typeof spawn>
-): Promise<void> {
+async function killProcess(child: ReturnType<typeof spawn>): Promise<void> {
   if (child.exitCode === null && child.signalCode === null) {
     if (process.platform === "win32" && child.pid) {
       try {
@@ -95,7 +93,7 @@ async function killProcess(
 async function runIngestWorker(
   filename: string,
   events: RecognitionEventInput[],
-  seed: number
+  seed: number,
 ): Promise<void> {
   return new Promise((resolve, reject) => {
     const child = fork(join(__dirname, "ingest-child.ts"), [], {
@@ -134,6 +132,59 @@ async function runIngestWorker(
     child.on("error", onError);
     child.once("exit", onExit);
     child.send({ filename, events, seed });
+  });
+}
+
+interface CompactChildRequest {
+  filename: string;
+  sessionId: string;
+  rounds: number;
+  writer?: {
+    sourceId: string;
+    count: number;
+    delayMs: number;
+    seed: number;
+  };
+}
+
+function runCompactWorker(request: CompactChildRequest): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const child = fork(join(__dirname, "compact-child.ts"), [], {
+      execArgv: ["--import", "tsx"],
+      stdio: "ignore",
+    });
+    forkedChildren.push(child);
+
+    let settled = false;
+    const finish = (error?: Error) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeout);
+      child.off("message", onMessage);
+      child.off("error", onError);
+      child.off("exit", onExit);
+      if (error) reject(error);
+      else resolve();
+    };
+    const onMessage = (message: { ok?: boolean; message?: string }) => {
+      if (message.ok) finish();
+      else finish(new Error(message.message ?? "compact child failed"));
+    };
+    const onError = (error: Error) => finish(error);
+    const onExit = (code: number | null) => {
+      if (!settled && code !== 0) {
+        finish(new Error(`compact child exited with code ${code ?? "null"}`));
+      }
+    };
+    const timeout = setTimeout(() => {
+      child.kill("SIGKILL");
+      finish(new Error("compact child timed out"));
+    }, 30000);
+
+    child.on("message", onMessage);
+    child.on("error", onError);
+    child.once("exit", onExit);
+    child.send(request);
   });
 }
 
@@ -176,7 +227,7 @@ function assertRevisionIntegrity(filename: string): void {
            (SELECT COUNT(*) FROM revisions WHERE session_id = events.session_id) AS revision_count,
            (SELECT MAX(revision) FROM revisions WHERE session_id = events.session_id) AS max_revision
          FROM events
-         WHERE session_id = ?`
+         WHERE session_id = ?`,
       )
       .get(E2E_SESSION_ID) as
       | { event_count: number; revision_count: number; max_revision: number }
@@ -190,7 +241,7 @@ function assertRevisionIntegrity(filename: string): void {
         `SELECT revision, snapshot
          FROM revisions
          WHERE session_id = ?
-         ORDER BY revision ASC`
+         ORDER BY revision ASC`,
       )
       .all(E2E_SESSION_ID) as Array<{ revision: number; snapshot: string }>;
 
@@ -208,9 +259,11 @@ function assertRevisionIntegrity(filename: string): void {
 
 afterEach(async () => {
   await Promise.allSettled(
-    forkedChildren.splice(0).map((child) => killProcess(child))
+    forkedChildren.splice(0).map((child) => killProcess(child)),
   );
-  await Promise.allSettled(children.splice(0).map((child) => killProcess(child)));
+  await Promise.allSettled(
+    children.splice(0).map((child) => killProcess(child)),
+  );
   while (stores.length > 0) {
     stores.pop()?.close();
   }
@@ -243,8 +296,8 @@ test("multiple worker instances concurrently converge to one deterministic snaps
 
   await Promise.all(
     workerEvents.map((events, index) =>
-      runIngestWorker(filename, events, (index + 1) * 17)
-    )
+      runIngestWorker(filename, events, (index + 1) * 17),
+    ),
   );
 
   const { store } = createStore(filename);
@@ -265,7 +318,7 @@ test("killing a process mid-ingest leaves no half transaction and resume converg
     {
       env: { ...process.env, E2E_DB: filename },
       stdio: "ignore",
-    }
+    },
   );
   children.push(child);
 
@@ -278,7 +331,7 @@ test("killing a process mid-ingest leaves no half transaction and resume converg
         .prepare(
           `SELECT 1 AS exists_flag
            FROM sqlite_master
-           WHERE type = 'table' AND name = 'revisions'`
+           WHERE type = 'table' AND name = 'revisions'`,
         )
         .get() as { exists_flag: number } | undefined;
       if (!table) continue;
@@ -286,12 +339,15 @@ test("killing a process mid-ingest leaves no half transaction and resume converg
       const row = db
         .prepare(
           `SELECT COALESCE(MAX(revision), 0) AS revision
-           FROM revisions WHERE session_id = ?`
+           FROM revisions WHERE session_id = ?`,
         )
         .get(E2E_SESSION_ID) as { revision: number };
       maxRevision = row.revision;
     }
-    assert.ok(maxRevision > 0, "child should have committed at least one revision");
+    assert.ok(
+      maxRevision > 0,
+      "child should have committed at least one revision",
+    );
   } finally {
     db.close();
   }
@@ -308,11 +364,11 @@ test("killing a process mid-ingest leaves no half transaction and resume converg
       openRawDatabase(filename)
         .prepare(`SELECT event_id FROM events WHERE session_id = ?`)
         .all(E2E_SESSION_ID) as Array<{ event_id: string }>
-    ).map((row) => row.event_id)
+    ).map((row) => row.event_id),
   );
   const missing = shuffleE2EEvents(
     makeE2EEvents().filter((event) => !existing.has(event.eventId)),
-    91
+    91,
   );
 
   for (const event of missing) {
@@ -370,8 +426,95 @@ test("slow consumer with small pages receives every revision without gaps or rep
   assert.equal(received.length, finalRevision);
   assert.deepEqual(
     received,
-    Array.from({ length: finalRevision }, (_, index) => index + 1)
+    Array.from({ length: finalRevision }, (_, index) => index + 1),
   );
   assert.deepEqual(consumer.fetch(10), []);
   assert.equal(consumer.getCursor(), finalRevision);
+});
+
+test("concurrent writers and compaction preserve contiguous revisions and snapshot", async () => {
+  const dir = tempPath();
+  const filename = join(dir, "compact-concurrent.db");
+  const sessionId = "concurrent-compact";
+  const sources = ["writer-a", "writer-b", "writer-c"];
+  const eventsPerWriter = 25;
+
+  const writers = sources.map((sourceId, index) =>
+    runCompactWorker({
+      filename,
+      sessionId,
+      rounds: 0,
+      writer: {
+        sourceId,
+        count: eventsPerWriter,
+        delayMs: 4,
+        seed: index + 11,
+      },
+    }),
+  );
+  const compactor = runCompactWorker({
+    filename,
+    sessionId,
+    rounds: 60,
+  });
+
+  await Promise.all([...writers, compactor]);
+
+  const { store } = createStore(filename);
+  const snapshot = store.getSnapshot(sessionId);
+  assert.equal(snapshot.segments.length, sources.length * eventsPerWriter);
+  assert.equal(snapshot.summary.eventCount, sources.length * eventsPerWriter);
+
+  const expectedFinalText = sources
+    .flatMap((sourceId) =>
+      Array.from(
+        { length: eventsPerWriter },
+        (_, seq) => `${sourceId}:${seq} `,
+      ),
+    )
+    .join("");
+  assert.equal(snapshot.finalText, expectedFinalText);
+
+  const db = openRawDatabase(filename);
+  try {
+    const state = db
+      .prepare(
+        `SELECT baseline_revision, compacted_through_revision,
+                total_revisions_removed
+         FROM compaction_state WHERE session_id = ?`,
+      )
+      .get(sessionId) as
+      | {
+          baseline_revision: number;
+          compacted_through_revision: number;
+          total_revisions_removed: number;
+        }
+      | undefined;
+    assert.ok(state, "compaction should have run");
+    assert.ok(state!.total_revisions_removed > 0);
+    assert.ok(state!.baseline_revision > 0);
+
+    const revisions = db
+      .prepare(
+        `SELECT revision FROM revisions
+         WHERE session_id = ?
+         ORDER BY revision ASC`,
+      )
+      .all(sessionId) as Array<{ revision: number }>;
+
+    let expected = state!.baseline_revision + 1;
+    for (const row of revisions) {
+      assert.equal(row.revision, expected);
+      expected += 1;
+    }
+
+    const maxRevision =
+      revisions.length > 0
+        ? revisions.at(-1)!.revision
+        : state!.baseline_revision;
+    assert.equal(maxRevision, snapshot.revision);
+    assert.equal(snapshot.revision, sources.length * eventsPerWriter);
+  } finally {
+    db.close();
+  }
 });
