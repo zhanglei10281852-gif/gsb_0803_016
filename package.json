@@ -1,0 +1,29 @@
+{
+  "name": "asr-confluence",
+  "version": "1.0.0",
+  "description": "Embedded library that merges partial/final fragments from multiple ASR sources into queryable snapshots and a durable revision stream backed by SQLite.",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "test": "vitest run test/unit",
+    "e2e": "npm run build && vitest run test/e2e",
+    "prepublishOnly": "npm run build"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "license": "MIT",
+  "dependencies": {
+    "better-sqlite3": "^11.8.1"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.12",
+    "@types/node": "^20.17.10",
+    "typescript": "^5.7.2",
+    "vitest": "^2.1.8"
+  }
+}
