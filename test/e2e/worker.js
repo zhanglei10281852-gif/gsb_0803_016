@@ -86,23 +86,43 @@ function run() {
         }));
       } else if (cmd.action === 'consumer-read') {
         const consumer = store.consumer(cmd.sessionId, cmd.consumerId);
-        const batch = consumer.read(cmd.limit || 100);
-        process.stdout.write(JSON.stringify({
-          ok: true,
-          cursor: consumer.getCursor(),
-          revisions: batch.map(r => ({
-            revision: r.revision,
-            sourceId: r.sourceId,
-            sourceSeq: r.sourceSeq,
-            changeType: r.changeType,
-            correctionId: r.correctionId,
-            actor: r.correction ? r.correction.actor : null,
-          })),
-        }));
+        try {
+          const batch = consumer.read(cmd.limit || 100);
+          process.stdout.write(JSON.stringify({
+            ok: true,
+            resetRequired: false,
+            cursor: consumer.getCursor(),
+            revisions: batch.map(r => ({
+              revision: r.revision,
+              sourceId: r.sourceId,
+              sourceSeq: r.sourceSeq,
+              changeType: r.changeType,
+              correctionId: r.correctionId,
+              actor: r.correction ? r.correction.actor : null,
+            })),
+          }));
+        } catch (err) {
+          process.stdout.write(JSON.stringify({
+            ok: false,
+            code: err.code,
+            resetRequired: true,
+            safeRevision: err.safeRevision,
+            currentRevision: err.currentRevision,
+            checkpointRevision: err.checkpointRevision,
+            message: err.message,
+          }));
+        }
       } else if (cmd.action === 'consumer-ack') {
         const consumer = store.consumer(cmd.sessionId, cmd.consumerId);
         consumer.ack(cmd.revision);
         process.stdout.write(JSON.stringify({ ok: true, cursor: consumer.getCursor() }));
+      } else if (cmd.action === 'consumer-heartbeat') {
+        const consumer = store.consumer(cmd.sessionId, cmd.consumerId);
+        consumer.heartbeat();
+        process.stdout.write(JSON.stringify({ ok: true }));
+      } else if (cmd.action === 'consumer-info') {
+        const consumer = store.consumer(cmd.sessionId, cmd.consumerId);
+        process.stdout.write(JSON.stringify({ ok: true, info: consumer.getLeaseInfo() }));
       } else if (cmd.action === 'revisions-count') {
         const session = store.session(cmd.sessionId);
         const db = new Database(cmd.dbPath, { readonly: true });
@@ -156,6 +176,9 @@ function run() {
         const row = db.prepare('SELECT session_id FROM sessions WHERE session_id = ?').get(cmd.sessionId);
         db.close();
         process.stdout.write(JSON.stringify({ ok: true, exists: !!row }));
+      } else if (cmd.action === 'compact-session') {
+        const stats = store.compactSession(cmd.sessionId);
+        process.stdout.write(JSON.stringify({ ok: true, stats }));
       } else {
         process.stdout.write(JSON.stringify({ ok: false, error: 'unknown action: ' + cmd.action }));
       }

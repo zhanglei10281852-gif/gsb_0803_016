@@ -16,7 +16,8 @@ const ARCHIVE_MAGIC = Buffer.from('ASRA', 'ascii');
 const ARCHIVE_VERSION = 1;
 const SEGMENT_HEADER_SIZE = 5;
 
-type SegmentType = 'H' | 'S' | 'E' | 'F' | 'R' | 'C' | 'L' | 'U' | 'X';
+type SegmentType =
+  | 'H' | 'S' | 'E' | 'F' | 'R' | 'C' | 'L' | 'U' | 'K' | 'X';
 
 export interface ArchiveCounts {
   session: number;
@@ -26,6 +27,7 @@ export interface ArchiveCounts {
   corrections: number;
   leases: number;
   cursors: number;
+  checkpoints: number;
 }
 
 interface ArchiveHeader {
@@ -44,6 +46,7 @@ interface ParsedArchive {
   corrections: Record<string, unknown>[];
   leases: Record<string, unknown>[];
   cursors: Record<string, unknown>[];
+  checkpoints: Record<string, unknown>[];
   unknownSegments: { type: string; payload: Buffer }[];
 }
 
@@ -52,6 +55,8 @@ export interface ExportResult {
   path: string;
   bytesWritten: number;
   counts: ArchiveCounts;
+  sha256: string;
+  maxRevision: number;
 }
 
 export interface ImportResult {
@@ -76,11 +81,20 @@ export function writeSessionArchive(
     const writer = createWriteStream(filePath);
     let bytesWritten = 0;
     let counts: ArchiveCounts | null = null;
+    let maxRevision = 0;
+    const fileHasher = createHash('sha256');
 
     writer.on('error', reject);
     writer.on('finish', () => {
       if (counts) {
-        resolve({ sessionId, path: filePath, bytesWritten, counts });
+        resolve({
+          sessionId,
+          path: filePath,
+          bytesWritten,
+          counts,
+          sha256: fileHasher.digest('hex'),
+          maxRevision,
+        });
       }
     });
 
@@ -88,6 +102,7 @@ export function writeSessionArchive(
       try {
         for await (const chunk of generateArchive(db, sessionId)) {
           if (chunk.length === 0) continue;
+          fileHasher.update(chunk);
           if (chunk[0] === 0x48) {
             const len = chunk.readUInt32LE(1);
             const json = JSON.parse(
@@ -100,6 +115,12 @@ export function writeSessionArchive(
           bytesWritten += chunk.length;
           writer.write(chunk);
         }
+        const revRow = db
+          .prepare(
+            'SELECT latest_revision AS r FROM sessions WHERE session_id = ?',
+          )
+          .get(sessionId) as { r: number } | undefined;
+        maxRevision = revRow ? revRow.r : 0;
         writer.end();
       } catch (err) {
         writer.destroy(err as Error);
@@ -139,9 +160,11 @@ async function* generateArchive(
         (SELECT COUNT(*) FROM revisions WHERE session_id = ?) AS revisions,
         (SELECT COUNT(*) FROM corrections WHERE session_id = ?) AS corrections,
         (SELECT COUNT(*) FROM correction_leases WHERE session_id = ?) AS leases,
-        (SELECT COUNT(*) FROM consumer_cursors WHERE session_id = ?) AS cursors`,
+        (SELECT COUNT(*) FROM consumer_cursors WHERE session_id = ?) AS cursors,
+        (SELECT COUNT(*) FROM compaction_checkpoints WHERE session_id = ?) AS checkpoints`,
     )
     .get(
+      sessionId,
       sessionId,
       sessionId,
       sessionId,
@@ -158,6 +181,7 @@ async function* generateArchive(
     corrections: countRow.corrections,
     leases: countRow.leases,
     cursors: countRow.cursors,
+    checkpoints: countRow.checkpoints,
   };
 
   const hasher = createHash('sha256');
@@ -192,6 +216,7 @@ async function* generateArchive(
     ['C', 'corrections', 'revision'],
     ['L', 'correction_leases', 'source_id, source_seq'],
     ['U', 'consumer_cursors', 'consumer_id'],
+    ['K', 'compaction_checkpoints', 'max_revision'],
   ];
 
   for (const [type, table, orderBy] of tableDefs) {
@@ -252,6 +277,7 @@ export function parseArchiveBuffer(buf: Buffer): ParsedArchive {
   const corrections: Record<string, unknown>[] = [];
   const leases: Record<string, unknown>[] = [];
   const cursors: Record<string, unknown>[] = [];
+  const checkpoints: Record<string, unknown>[] = [];
   const unknownSegments: { type: string; payload: Buffer }[] = [];
   let checksumSegment: { sha256: string; counts: ArchiveCounts } | null =
     null;
@@ -316,6 +342,9 @@ export function parseArchiveBuffer(buf: Buffer): ParsedArchive {
         case 'U':
           cursors.push(obj);
           break;
+        case 'K':
+          checkpoints.push(obj);
+          break;
         default:
           unknownSegments.push({
             type,
@@ -352,6 +381,7 @@ export function parseArchiveBuffer(buf: Buffer): ParsedArchive {
     corrections: corrections.length,
     leases: leases.length,
     cursors: cursors.length,
+    checkpoints: checkpoints.length,
   };
 
   assertCountsMatch(header.counts, actualCounts, 'header');
@@ -366,6 +396,7 @@ export function parseArchiveBuffer(buf: Buffer): ParsedArchive {
     corrections,
     leases,
     cursors,
+    checkpoints,
     unknownSegments,
   };
 }
@@ -433,6 +464,8 @@ export function importSessionArchive(
       insertRow(db, 'correction_leases', row);
     for (const row of parsed.cursors)
       insertRow(db, 'consumer_cursors', row);
+    for (const row of parsed.checkpoints)
+      insertRow(db, 'compaction_checkpoints', row);
   });
 
   importTxn.immediate();
@@ -451,6 +484,7 @@ function verifySessionIdentical(
     ['corrections', parsed.corrections],
     ['correction_leases', parsed.leases],
     ['consumer_cursors', parsed.cursors],
+    ['compaction_checkpoints', parsed.checkpoints],
   ];
 
   for (const [table, expectedRows] of tables) {

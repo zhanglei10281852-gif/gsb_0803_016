@@ -123,6 +123,7 @@ export interface CursorRow {
   consumer_id: string;
   cursor_revision: number;
   updated_at: number;
+  lease_expires_at: number | null;
 }
 
 export interface LeaseRow {
@@ -195,4 +196,53 @@ export interface SubmitCorrectionOptions {
   leaseId: string;
   correctedContent: string;
   reason: string;
+}
+
+export interface CheckpointRow {
+  session_id: string;
+  checkpoint_id: string;
+  archive_path: string;
+  archive_sha256: string;
+  min_revision: number;
+  max_revision: number;
+  archived_at: number;
+  revisions_count: number;
+  events_count: number;
+}
+
+export interface Checkpoint {
+  checkpointId: string;
+  sessionId: string;
+  archivePath: string;
+  archiveSha256: string;
+  minRevision: number;
+  maxRevision: number;
+  archivedAt: number;
+  revisionsCount: number;
+  eventsCount: number;
+}
+
+export interface CompactionStats {
+  sessionId: string;
+  compacted: boolean;
+  safeRevision: number;
+  archivedRevision: number;
+  slowestActiveCursor: number | null;
+  revisionsRemoved: number;
+  eventsRemoved: number;
+  revisionsRemaining: number;
+  eventsRemaining: number;
+  checkpointId: string | null;
+  skippedReason: string | null;
+}
+
+export interface ConsumerLeaseInfo {
+  consumerId: string;
+  cursorRevision: number;
+  leaseExpiresAt: number | null;
+  active: boolean;
+}
+
+export interface ConsumerOptions {
+  leaseTtlMs?: number;
 }

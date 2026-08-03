@@ -189,6 +189,81 @@ ASRA (4B magic) | version (uint32 LE) | segments... | checksum trailer
 | `ArchiveVersionError` | `ARCHIVE_VERSION` | 归档格式版本高于当前支持版本 |
 | `SessionExistsError` | `SESSION_EXISTS` | 目标会话已存在且内容与归档不同 |
 
+## 长会话压缩：基于消费者租约与归档检查点
+
+持续数月的长会话会产生大量修订日志。压缩机制在保证不丢失任何活跃消费者数据的前提下回收旧修订：
+
+1. **导出归档**（`exportSession`）自动创建一个**检查点**（checkpoint），记录已归档覆盖的最大修订号和归档 SHA-256。
+2. **消费者租约**：每次 `ack()` 自动续租（默认 TTL 24 小时），`heartbeat()` 可手动续约，`releaseLease()` 主动释放。只有持有未过期租约的消费者才算"活跃"。
+3. **安全水位**（safe watermark）= `min(已归档修订号, 最慢活跃消费者 cursor)`。只有水位之前的修订才允许删除。
+4. **压缩**（`compactSession`）原子删除水位之前的 revisions 和对应的 incoming_events，但保留 fragments（当前快照）、corrections、leases、cursors。修订号计数器由 `sessions.latest_revision` 持久化，压缩后继续单调递增。
+
+```typescript
+// 1. 定期归档（自动记录 checkpoint）
+await store.exportSession('call-abc', '/archives/call-abc.asra');
+
+// 2. 活跃消费者 ack 会自动续租
+const consumer = store.consumer('call-abc', 'qc-engine', {
+  leaseTtlMs: 3600_000,  // 可选，默认 24h
+});
+consumer.ack(latestRevision);
+
+// 3. 压缩（只删除最慢活跃消费者已确认且已归档的数据）
+const stats = store.compactSession('call-abc');
+console.log(stats);
+// { compacted: true, safeRevision: 1500, revisionsRemoved: 1500, ... }
+```
+
+### Reset-Required 协议
+
+当过期消费者（游标低于压缩水位）再次调用 `read()` 时，抛出 `ConsumerResetRequiredError`（`code: 'CONSUMER_RESET_REQUIRED'`），**不会静默跳过**。错误携带：
+
+- `safeRevision` — 压缩水位（已删除的最高修订号）
+- `currentRevision` — 当前最新修订号
+- `checkpointRevision` — 最近检查点修订号
+
+消费者应通过 `consumer.getSnapshot()` 获取当前快照，然后 `ack(safeRevision)` 将游标推进到水位，之后即可正常续读新修订：
+
+```typescript
+try {
+  consumer.read(100);
+} catch (err) {
+  if (err.code === 'CONSUMER_RESET_REQUIRED') {
+    const snap = consumer.getSnapshot();  // 当前完整快照
+    consumer.ack(err.safeRevision);       // 跳到水位
+    const newRevisions = consumer.read(100);  // 续读
+  }
+}
+```
+
+### 压缩统计（`CompactionStats`）
+
+| 字段 | 含义 |
+|------|------|
+| `compacted` | 是否执行了删除 |
+| `safeRevision` | 实际压缩水位 |
+| `archivedRevision` | 归档已覆盖的最大修订 |
+| `slowestActiveCursor` | 最慢活跃消费者游标（null 表示无活跃消费者） |
+| `revisionsRemoved` / `eventsRemoved` | 删除的行数 |
+| `revisionsRemaining` / `eventsRemaining` | 剩余行数 |
+| `skippedReason` | 未压缩时的原因（如"no archive checkpoint exists"） |
+
+### 压缩后的归档完整性
+
+压缩后导出的归档仍然通过第三轮的 SHA-256 完整性链验证。归档包含 `compaction_checkpoints`（K 段），导入隔离环境后：
+- 当前快照（fragments）完整保留
+- 修订历史从压缩水位之后开始
+- 检查点记录指示了历史数据所在的先前归档
+- 消费者游标位置保留，可继续续读
+- 重建出的快照文本与未压缩实现完全一致
+
+### 新增错误码
+
+| 错误类 | `code` | 含义 |
+|--------|--------|------|
+| `ConsumerResetRequiredError` | `CONSUMER_RESET_REQUIRED` | 消费者游标低于压缩水位，需 reset |
+| `NoCheckpointError` | `NO_CHECKPOINT` | 尚无归档检查点，无法压缩 |
+
 ## 核心 API
 
 ### `RecognitionStore.open(options)`
@@ -262,22 +337,23 @@ ASRA (4B magic) | version (uint32 LE) | segments... | checksum trailer
 | 快照全文存于每条修订 | 消费者无需重放全部历史即可获取任意时刻的完整文本；代价是存储空间随修订数线性增长，适合质检类需要审计追溯的场景。 |
 | 消费者采用拉模型 + 轮询 | 不引入 pub/sub 或通知机制，保持嵌入式库的简单可靠；`stream()` 提供 async iterator 简化消费。 |
 | `synchronous=FULL` | 以少量写入吞吐换取断电后的持久性保证，符合"状态、修订与游标在进程崩溃后保持一致"的要求。 |
-| 无 TTL / 无压缩 | 库不自动删除修订或会话，由嵌入应用按合规需求管理生命周期。 |
+| 压缩需显式触发 | 库不在写入路径上自动压缩，避免长会话中的意外延迟；应用定期 `exportSession` + `compactSession`，安全水位由活跃消费者租约和归档检查点共同约束。 |
 
 ## 项目结构
 
 ```
 src/
   index.ts       公开 API 导出
-  store.ts       RecognitionStore 入口（含 exportSession/importSession）
+  store.ts       RecognitionStore 入口（含归档与压缩）
   session.ts     事件摄入、快照、修订分配、租约与校正事务
-  consumer.ts    消费者游标、读取、确认、流式订阅
+  consumer.ts    消费者游标、心跳租约、reset-required 检测
   archive.ts     自包含归档格式、流式导出、校验与原子导入
+  compaction.ts  安全水位计算、原子压缩、检查点记录
   db.ts          SQLite 连接、pragma、schema 与迁移
   snapshot.ts    确定性快照/摘要构建
   hash.ts        事件内容指纹（冲突检测）
-  errors.ts      自定义错误类型（含租约、归档冲突）
+  errors.ts      自定义错误类型
 test/
-  unit/          幂等、乱序、final 保护、修订、消费者、校正租约、归档
-  e2e/           多进程并发、SIGKILL 断电重开、慢消费者、校正流程、归档故障注入
+  unit/          幂等、乱序、final 保护、修订、消费者、校正、归档、压缩
+  e2e/           多进程并发、断电重开、慢消费者、校正、归档故障注入、压缩
 ```

@@ -15,6 +15,8 @@ export {
   ArchiveChecksumError,
   ArchiveVersionError,
   SessionExistsError,
+  ConsumerResetRequiredError,
+  NoCheckpointError,
 } from './errors';
 export type {
   IngestEvent,
@@ -34,6 +36,10 @@ export type {
   Correction,
   AcquireLeaseOptions,
   SubmitCorrectionOptions,
+  CompactionStats,
+  Checkpoint,
+  ConsumerLeaseInfo,
+  ConsumerOptions,
 } from './types';
 export type {
   ArchiveCounts,

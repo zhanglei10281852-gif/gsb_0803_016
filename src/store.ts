@@ -9,7 +9,8 @@ import {
   type ExportResult,
   type ImportResult,
 } from './archive';
-import type { StoreOptions } from './types';
+import { compactSession, recordCheckpoint } from './compaction';
+import type { StoreOptions, CompactionStats, ConsumerOptions } from './types';
 
 export class RecognitionStore {
   private db: DatabaseType | null = null;
@@ -39,20 +40,45 @@ export class RecognitionStore {
     return s;
   }
 
-  consumer(sessionId: string, consumerId: string): Consumer {
+  consumer(
+    sessionId: string,
+    consumerId: string,
+    options?: ConsumerOptions,
+  ): Consumer {
     if (!this.db) throw new StoreClosedError();
     const session = this.session(sessionId);
-    return new Consumer(this.db, session, consumerId);
+    return new Consumer(this.db, session, consumerId, options);
   }
 
-  exportSession(sessionId: string, filePath: string): Promise<ExportResult> {
+  async exportSession(
+    sessionId: string,
+    filePath: string,
+  ): Promise<ExportResult> {
     if (!this.db) throw new StoreClosedError();
-    return writeSessionArchive(this.db, sessionId, filePath);
+    const result = await writeSessionArchive(this.db, sessionId, filePath);
+
+    recordCheckpoint(
+      this.db,
+      sessionId,
+      filePath,
+      result.sha256,
+      1,
+      result.maxRevision,
+      result.counts.revisions,
+      result.counts.events,
+    );
+
+    return result;
   }
 
   importSession(archivePath: string): ImportResult {
     if (!this.db) throw new StoreClosedError();
     return importSessionArchive(this.db, archivePath);
+  }
+
+  compactSession(sessionId: string): CompactionStats {
+    if (!this.db) throw new StoreClosedError();
+    return compactSession(this.db, sessionId);
   }
 
   close(): void {

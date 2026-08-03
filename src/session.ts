@@ -53,6 +53,7 @@ export class Session {
   private readonly insertRevisionStmt;
   private readonly nextRevisionStmt;
   private readonly updateSessionStmt;
+  private readonly touchSessionStmt;
   private readonly selectFragmentsStmt;
   private readonly selectRevisionStmt;
   private readonly selectLatestRevisionStmt;
@@ -137,12 +138,17 @@ export class Session {
                @correctionId, @metadata, @createdAt)`,
     );
     this.nextRevisionStmt = db.prepare(
-      `SELECT COALESCE(MAX(revision), 0) + 1 AS next_rev
-       FROM revisions WHERE session_id = ?`,
+      `SELECT COALESCE(
+         (SELECT latest_revision FROM sessions WHERE session_id = ?),
+         0
+       ) + 1 AS next_rev`,
     );
     this.updateSessionStmt = db.prepare(
-      `UPDATE sessions SET updated_at = ?, latest_revision =
-         (SELECT MAX(revision) FROM revisions WHERE session_id = ?)
+      `UPDATE sessions SET updated_at = ?, latest_revision = ?
+       WHERE session_id = ?`,
+    );
+    this.touchSessionStmt = db.prepare(
+      `UPDATE sessions SET updated_at = ?
        WHERE session_id = ?`,
     );
     this.selectFragmentsStmt = db.prepare(SELECT_FRAGMENTS);
@@ -326,7 +332,7 @@ export class Session {
       }
 
       if (!shouldUpdate) {
-        this.updateSessionStmt.run(now, this.sessionId, this.sessionId);
+        this.touchSessionStmt.run(now, this.sessionId);
         return { status: 'ignored', revision: null, reason };
       }
 
@@ -356,7 +362,7 @@ export class Session {
         this.sessionId,
         event.eventId,
       );
-      this.updateSessionStmt.run(now, this.sessionId, this.sessionId);
+      this.updateSessionStmt.run(now, revision, this.sessionId);
 
       return { status: 'accepted', revision, reason: null };
     });
@@ -553,7 +559,7 @@ export class Session {
         });
 
         this.consumeLeaseStmt.run(now, this.sessionId, options.leaseId);
-        this.updateSessionStmt.run(now, this.sessionId, this.sessionId);
+        this.updateSessionStmt.run(now, revision, this.sessionId);
 
         return {
           correctionId,

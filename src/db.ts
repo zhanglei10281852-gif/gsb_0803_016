@@ -63,11 +63,26 @@ CREATE TABLE IF NOT EXISTS revisions (
 );
 
 CREATE TABLE IF NOT EXISTS consumer_cursors (
-  session_id      TEXT NOT NULL,
-  consumer_id     TEXT NOT NULL,
-  cursor_revision INTEGER NOT NULL DEFAULT 0,
-  updated_at      INTEGER NOT NULL,
+  session_id       TEXT NOT NULL,
+  consumer_id      TEXT NOT NULL,
+  cursor_revision  INTEGER NOT NULL DEFAULT 0,
+  updated_at       INTEGER NOT NULL,
+  lease_expires_at INTEGER,
   PRIMARY KEY (session_id, consumer_id),
+  FOREIGN KEY (session_id) REFERENCES sessions(session_id)
+);
+
+CREATE TABLE IF NOT EXISTS compaction_checkpoints (
+  session_id      TEXT NOT NULL,
+  checkpoint_id   TEXT NOT NULL,
+  archive_path    TEXT NOT NULL,
+  archive_sha256  TEXT NOT NULL,
+  min_revision    INTEGER NOT NULL,
+  max_revision    INTEGER NOT NULL,
+  archived_at     INTEGER NOT NULL,
+  revisions_count INTEGER NOT NULL,
+  events_count    INTEGER NOT NULL,
+  PRIMARY KEY (session_id, checkpoint_id),
   FOREIGN KEY (session_id) REFERENCES sessions(session_id)
 );
 
@@ -142,6 +157,7 @@ function runMigrations(db: DatabaseType): void {
   );
   addColumnIfMissing(db, 'revisions', 'correction_id', 'TEXT');
   addColumnIfMissing(db, 'revisions', 'metadata', 'TEXT');
+  addColumnIfMissing(db, 'consumer_cursors', 'lease_expires_at', 'INTEGER');
 }
 
 export interface OpenDbResult {

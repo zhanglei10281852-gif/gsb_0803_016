@@ -93,3 +93,30 @@ export class SessionExistsError extends Error {
     this.name = 'SessionExistsError';
   }
 }
+
+export class ConsumerResetRequiredError extends Error {
+  public readonly code = 'CONSUMER_RESET_REQUIRED';
+  public readonly safeRevision: number;
+  public readonly currentRevision: number;
+  public readonly checkpointRevision: number;
+  constructor(
+    message: string,
+    safeRevision: number,
+    currentRevision: number,
+    checkpointRevision: number,
+  ) {
+    super(message);
+    this.name = 'ConsumerResetRequiredError';
+    this.safeRevision = safeRevision;
+    this.currentRevision = currentRevision;
+    this.checkpointRevision = checkpointRevision;
+  }
+}
+
+export class NoCheckpointError extends Error {
+  public readonly code = 'NO_CHECKPOINT';
+  constructor(message: string) {
+    super(message);
+    this.name = 'NoCheckpointError';
+  }
+}
