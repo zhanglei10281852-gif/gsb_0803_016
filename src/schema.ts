@@ -1,7 +1,8 @@
 export const SCHEMA = `
 CREATE TABLE IF NOT EXISTS sessions (
-  session_id    TEXT PRIMARY KEY,
-  last_revision INTEGER NOT NULL DEFAULT 0
+  session_id     TEXT PRIMARY KEY,
+  last_revision  INTEGER NOT NULL DEFAULT 0,
+  first_revision INTEGER NOT NULL DEFAULT 1
 );
 
 CREATE TABLE IF NOT EXISTS events (
@@ -74,6 +75,26 @@ CREATE TABLE IF NOT EXISTS imports (
   imported_at INTEGER NOT NULL,
   PRIMARY KEY (session_id, archive_id)
 );
+
+-- Live consumer leases; only these protect history from compaction.
+CREATE TABLE IF NOT EXISTS consumer_leases (
+  consumer_id TEXT NOT NULL,
+  session_id  TEXT NOT NULL,
+  expires_at  INTEGER NOT NULL,
+  created_at  INTEGER NOT NULL,
+  PRIMARY KEY (consumer_id, session_id)
+);
+
+-- Verified checkpoint archives produced by compaction.
+CREATE TABLE IF NOT EXISTS checkpoints (
+  session_id          TEXT NOT NULL,
+  checkpoint_revision INTEGER NOT NULL,
+  archive_id          TEXT NOT NULL,
+  sha256              TEXT NOT NULL,
+  raw_json            TEXT NOT NULL,
+  created_at          INTEGER NOT NULL,
+  PRIMARY KEY (session_id, checkpoint_revision)
+);
 `;
 
 /**
@@ -83,4 +104,5 @@ CREATE TABLE IF NOT EXISTS imports (
 export const MIGRATIONS = {
   events_applied_revision: `ALTER TABLE events ADD COLUMN applied_revision INTEGER`,
   corrections_base_revision: `ALTER TABLE corrections ADD COLUMN base_revision INTEGER`,
+  sessions_first_revision: `ALTER TABLE sessions ADD COLUMN first_revision INTEGER NOT NULL DEFAULT 1`,
 };

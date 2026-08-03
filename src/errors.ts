@@ -39,3 +39,25 @@ export class ReviewConflictError extends Error {
     this.reason = reason;
   }
 }
+
+/**
+ * A consumer tried to resume from a cursor that compaction has already
+ * reclaimed. It must rebuild from the latest checkpoint archive and reset
+ * its cursor (see resetConsumerToCheckpoint); nothing is skipped silently.
+ */
+export class ResetRequiredError extends Error {
+  readonly code = 'RESET_REQUIRED';
+  /** Smallest revision still present in the stream. */
+  readonly firstAvailableRevision: number;
+  /** Revision covered by the latest checkpoint, if one exists. */
+  readonly checkpointRevision: number | null;
+  constructor(firstAvailableRevision: number, checkpointRevision: number | null) {
+    super(
+      `cursor is behind compacted history; first available revision is ${firstAvailableRevision}` +
+        (checkpointRevision === null ? '' : `, latest checkpoint covers ${checkpointRevision}`),
+    );
+    this.name = 'ResetRequiredError';
+    this.firstAvailableRevision = firstAvailableRevision;
+    this.checkpointRevision = checkpointRevision;
+  }
+}

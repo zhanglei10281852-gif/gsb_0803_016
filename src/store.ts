@@ -5,12 +5,17 @@ import { once } from 'node:events';
 import readline from 'node:readline';
 import { collectArchive, parseArchive, type ParsedArchive } from './archive';
 import { buildSnapshot, correctionKey, eventHash, type EventRow } from './core';
-import { ConflictError, ReviewConflictError, ValidationError } from './errors';
+import { ConflictError, ResetRequiredError, ReviewConflictError, ValidationError } from './errors';
 import { MIGRATIONS, SCHEMA } from './schema';
 import type {
   AcquireLeaseOptions,
   AsrEvent,
   ChangeRecord,
+  CheckpointInfo,
+  CompactionStats,
+  ConsumerLeaseInfo,
+  ConsumerLeaseOptions,
+  ConsumerStatus,
   CorrectionInfo,
   ImportResult,
   IngestResult,
@@ -19,6 +24,7 @@ import type {
   RevisionEntry,
   SegmentRef,
   Snapshot,
+  StorageStats,
   SubmitCorrectionOptions,
   SubmitCorrectionResult,
 } from './types';
@@ -141,6 +147,7 @@ export class TranscriptStore {
     if (!hasColumn('corrections', 'base_revision')) {
       this.db.exec(MIGRATIONS.corrections_base_revision);
     }
+    if (!hasColumn('sessions', 'first_revision')) this.db.exec(MIGRATIONS.sessions_first_revision);
   }
 
   /**
@@ -201,8 +208,14 @@ export class TranscriptStore {
       throw new ValidationError(`limit must be an integer in [1, ${MAX_LIMIT}]`);
     }
     const read = this.db.transaction((): PollResult => {
-      const last = this.lastRevision(sessionId);
+      const sess = this.db
+        .prepare('SELECT last_revision, first_revision FROM sessions WHERE session_id = ?')
+        .get(sessionId) as { last_revision: number; first_revision: number } | undefined;
+      const last = sess?.last_revision ?? 0;
       const acked = this.cursor(consumerId, sessionId);
+      if (sess && acked + 1 < sess.first_revision) {
+        throw new ResetRequiredError(sess.first_revision, this.latestCheckpoint(sessionId)?.revision ?? null);
+      }
       const rows = this.db
         .prepare(
           'SELECT revision, change_json FROM revisions WHERE session_id = ? AND revision > ? ORDER BY revision LIMIT ?',
@@ -371,6 +384,134 @@ export class TranscriptStore {
       crlfDelay: Infinity,
     });
     return this.importArchive(rl);
+  }
+
+  // ---------------------- consumer leases & compaction ----------------------
+
+  /**
+   * Register (or renew) a consumer's lease. Consumers with a live lease
+   * bound compaction: nothing at or below the slowest live cursor is
+   * reclaimed. Consumers whose lease expires stop protecting history and
+   * will get ResetRequiredError if compaction passed their cursor.
+   */
+  registerConsumer(consumerId: string, sessionId: string, options: ConsumerLeaseOptions): ConsumerLeaseInfo {
+    validateId('consumerId', consumerId);
+    validateId('sessionId', sessionId);
+    if (!Number.isFinite(options?.ttlMs) || options.ttlMs <= 0) {
+      throw new ValidationError('ttlMs must be a positive finite number');
+    }
+    const write = this.db.transaction((): ConsumerLeaseInfo => {
+      const now = this.nowFn();
+      const expiresAt = now + options.ttlMs;
+      this.db
+        .prepare(
+          `INSERT INTO consumer_leases (consumer_id, session_id, expires_at, created_at) VALUES (?, ?, ?, ?)
+           ON CONFLICT (consumer_id, session_id) DO UPDATE SET expires_at = excluded.expires_at`,
+        )
+        .run(consumerId, sessionId, expiresAt, now);
+      this.db
+        .prepare('INSERT OR IGNORE INTO cursors (consumer_id, session_id, acked_revision) VALUES (?, ?, 0)')
+        .run(consumerId, sessionId);
+      return { expiresAt };
+    });
+    return write.immediate();
+  }
+
+  /**
+   * Reclaim revision history that is (a) at or below the slowest live
+   * consumer cursor and (b) covered by a freshly generated checkpoint
+   * archive that passes the same integrity + semantic validation as any
+   * imported archive. Runs as one transaction; concurrent ingests/acks are
+   * safe. Returns observable stats.
+   */
+  compact(sessionId: string): CompactionStats {
+    validateId('sessionId', sessionId);
+    return this.db.transaction(() => this.compactOne(sessionId)).immediate();
+  }
+
+  /** Latest checkpoint produced by compaction, if any. */
+  latestCheckpoint(sessionId: string): CheckpointInfo | null {
+    validateId('sessionId', sessionId);
+    const row = this.db
+      .prepare(
+        'SELECT checkpoint_revision, archive_id, sha256, created_at FROM checkpoints WHERE session_id = ? ORDER BY checkpoint_revision DESC LIMIT 1',
+      )
+      .get(sessionId) as
+      | { checkpoint_revision: number; archive_id: string; sha256: string; created_at: number }
+      | undefined;
+    if (!row) return null;
+    return { revision: row.checkpoint_revision, archiveId: row.archive_id, sha256: row.sha256, createdAt: row.created_at };
+  }
+
+  /** Stream the latest checkpoint archive (NDJSON lines) for consumer rebuild. */
+  async *exportCheckpoint(sessionId: string): AsyncGenerator<string> {
+    validateId('sessionId', sessionId);
+    const row = this.db
+      .prepare(
+        'SELECT raw_json FROM checkpoints WHERE session_id = ? ORDER BY checkpoint_revision DESC LIMIT 1',
+      )
+      .get(sessionId) as { raw_json: string } | undefined;
+    if (!row) throw new ValidationError(`session "${sessionId}" has no checkpoint`);
+    for (const line of row.raw_json.split('\n')) {
+      if (line.length > 0) yield line + '\n';
+    }
+  }
+
+  /**
+   * Reset a consumer that hit ResetRequiredError: after rebuilding its
+   * downstream state from the checkpoint archive, move its cursor to the
+   * checkpoint revision so poll resumes from there. Explicit, never silent.
+   */
+  resetConsumerToCheckpoint(consumerId: string, sessionId: string): number {
+    validateId('consumerId', consumerId);
+    const cp = this.latestCheckpoint(sessionId);
+    if (!cp) throw new ValidationError(`session "${sessionId}" has no checkpoint to reset to`);
+    return this.ack(consumerId, sessionId, cp.revision);
+  }
+
+  /** Observable storage/compaction state of a session. */
+  storageStats(sessionId: string): StorageStats {
+    validateId('sessionId', sessionId);
+    const sess = this.db
+      .prepare('SELECT last_revision, first_revision FROM sessions WHERE session_id = ?')
+      .get(sessionId) as { last_revision: number; first_revision: number } | undefined;
+    if (!sess) throw new ValidationError(`session "${sessionId}" does not exist`);
+    const storedRevisions = (
+      this.db.prepare('SELECT COUNT(*) AS n FROM revisions WHERE session_id = ?').get(sessionId) as { n: number }
+    ).n;
+    const checkpoints = (
+      this.db
+        .prepare(
+          'SELECT checkpoint_revision, archive_id, sha256, created_at FROM checkpoints WHERE session_id = ? ORDER BY checkpoint_revision',
+        )
+        .all(sessionId) as { checkpoint_revision: number; archive_id: string; sha256: string; created_at: number }[]
+    ).map((r) => ({ revision: r.checkpoint_revision, archiveId: r.archive_id, sha256: r.sha256, createdAt: r.created_at }));
+    const now = this.nowFn();
+    const consumers = (
+      this.db
+        .prepare(
+          `SELECT c.consumer_id, c.acked_revision, l.expires_at
+           FROM cursors c LEFT JOIN consumer_leases l
+             ON l.consumer_id = c.consumer_id AND l.session_id = c.session_id
+           WHERE c.session_id = ? ORDER BY c.consumer_id`,
+        )
+        .all(sessionId) as { consumer_id: string; acked_revision: number; expires_at: number | null }[]
+    ).map(
+      (r): ConsumerStatus => ({
+        consumerId: r.consumer_id,
+        ackedRevision: r.acked_revision,
+        leaseExpiresAt: r.expires_at,
+        leaseLive: r.expires_at !== null && r.expires_at > now,
+      }),
+    );
+    return {
+      sessionId,
+      firstRevision: sess.first_revision,
+      lastRevision: sess.last_revision,
+      storedRevisions,
+      checkpoints,
+      consumers,
+    };
   }
 
   close(): void {
@@ -668,7 +809,7 @@ export class TranscriptStore {
   // ------------------------- archive internals -------------------------
 
   private commitImport(parsed: ParsedArchive): ImportResult {
-    const { archiveId, sessionId, lastRevision } = parsed.header;
+    const { archiveId, sessionId, lastRevision, firstRevision } = parsed.header;
     const existing = this.db
       .prepare('SELECT last_revision FROM sessions WHERE session_id = ?')
       .get(sessionId) as SessionRow | undefined;
@@ -685,8 +826,8 @@ export class TranscriptStore {
     }
 
     this.db
-      .prepare('INSERT INTO sessions (session_id, last_revision) VALUES (?, ?)')
-      .run(sessionId, lastRevision);
+      .prepare('INSERT INTO sessions (session_id, last_revision, first_revision) VALUES (?, ?, ?)')
+      .run(sessionId, lastRevision, firstRevision);
     const insertEvent = this.db.prepare(
       `INSERT INTO events (session_id, source_id, event_id, source_seq, kind, text, start_ms, content_hash, applied_revision)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
@@ -718,7 +859,90 @@ export class TranscriptStore {
         'INSERT INTO imports (session_id, archive_id, sha256, header_json, raw_json, imported_at) VALUES (?, ?, ?, ?, ?, ?)',
       )
       .run(sessionId, archiveId, parsed.sha256, parsed.headerJson, parsed.raw, this.nowFn());
+    if (parsed.checkpoint) {
+      this.db
+        .prepare(
+          `INSERT INTO checkpoints (session_id, checkpoint_revision, archive_id, sha256, raw_json, created_at)
+           VALUES (?, ?, ?, ?, ?, ?)
+           ON CONFLICT (session_id, checkpoint_revision) DO UPDATE SET
+             archive_id = excluded.archive_id, sha256 = excluded.sha256,
+             raw_json = excluded.raw_json, created_at = excluded.created_at`,
+        )
+        .run(sessionId, parsed.checkpoint.revision, parsed.checkpoint.archiveId, parsed.checkpoint.sha256, parsed.checkpoint.raw, this.nowFn());
+    }
 
     return { status: 'imported', sessionId, archiveId, lastRevision };
+  }
+
+  private compactOne(sessionId: string): CompactionStats {
+    const sess = this.db
+      .prepare('SELECT last_revision, first_revision FROM sessions WHERE session_id = ?')
+      .get(sessionId) as { last_revision: number; first_revision: number } | undefined;
+    if (!sess) throw new ValidationError(`session "${sessionId}" does not exist`);
+
+    const now = this.nowFn();
+    const consumers = this.db
+      .prepare(
+        `SELECT l.consumer_id, l.expires_at, COALESCE(c.acked_revision, 0) AS acked
+         FROM consumer_leases l LEFT JOIN cursors c
+           ON c.consumer_id = l.consumer_id AND c.session_id = l.session_id
+         WHERE l.session_id = ?`,
+      )
+      .all(sessionId) as { consumer_id: string; expires_at: number; acked: number }[];
+    const live = consumers.filter((c) => c.expires_at > now);
+
+    // Floor: nothing beyond the slowest live cursor may be reclaimed.
+    // With no live leases, everything up to lastRevision is reclaimable
+    // (expired consumers will get an explicit reset-required on return).
+    const floor = Math.min(live.length ? Math.min(...live.map((c) => c.acked)) : sess.last_revision, sess.last_revision);
+
+    const base: CompactionStats = {
+      sessionId,
+      reclaimedRevisions: 0,
+      bytesReclaimed: 0,
+      firstRevision: sess.first_revision,
+      lastRevision: sess.last_revision,
+      checkpointRevision: this.latestCheckpoint(sessionId)?.revision ?? null,
+      checkpointArchiveId: null,
+      checkpointSha256: null,
+      liveConsumers: live.length,
+      totalConsumers: consumers.length,
+    };
+    if (floor < sess.first_revision) return base; // nothing new to reclaim
+
+    // Gate: only reclaim what a *verifiable* checkpoint archive covers.
+    // Generate the archive and run the exact import-side validation on it
+    // before deleting anything.
+    const lines = collectArchive(this.db, sessionId, this.nowFn, { includeCheckpoint: false });
+    const parsed = parseArchive(lines);
+    this.db
+      .prepare(
+        `INSERT INTO checkpoints (session_id, checkpoint_revision, archive_id, sha256, raw_json, created_at)
+         VALUES (?, ?, ?, ?, ?, ?)
+         ON CONFLICT (session_id, checkpoint_revision) DO UPDATE SET
+           archive_id = excluded.archive_id, sha256 = excluded.sha256,
+           raw_json = excluded.raw_json, created_at = excluded.created_at`,
+      )
+      .run(sessionId, sess.last_revision, parsed.header.archiveId, parsed.sha256, parsed.raw, now);
+
+    const bytes = (
+      this.db
+        .prepare('SELECT COALESCE(SUM(LENGTH(change_json)), 0) AS b FROM revisions WHERE session_id = ? AND revision <= ?')
+        .get(sessionId, floor) as { b: number }
+    ).b;
+    this.db.prepare('DELETE FROM revisions WHERE session_id = ? AND revision <= ?').run(sessionId, floor);
+    this.db
+      .prepare('UPDATE sessions SET first_revision = ? WHERE session_id = ?')
+      .run(floor + 1, sessionId);
+
+    return {
+      ...base,
+      reclaimedRevisions: floor - sess.first_revision + 1,
+      bytesReclaimed: bytes,
+      firstRevision: floor + 1,
+      checkpointRevision: sess.last_revision,
+      checkpointArchiveId: parsed.header.archiveId,
+      checkpointSha256: parsed.sha256,
+    };
   }
 }

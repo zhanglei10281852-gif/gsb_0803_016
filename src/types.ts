@@ -136,6 +136,58 @@ export interface ImportResult {
   lastRevision: number;
 }
 
+export interface ConsumerLeaseOptions {
+  /** Lease time-to-live in milliseconds; renew by registering again. */
+  ttlMs: number;
+}
+
+export interface ConsumerLeaseInfo {
+  expiresAt: number;
+}
+
+export interface CompactionStats {
+  sessionId: string;
+  /** Revision-stream entries deleted by this compaction. */
+  reclaimedRevisions: number;
+  /** Approximate payload bytes of the reclaimed entries. */
+  bytesReclaimed: number;
+  /** Smallest revision still in the stream after compaction. */
+  firstRevision: number;
+  lastRevision: number;
+  /** Revision covered by the checkpoint created by this compaction. */
+  checkpointRevision: number | null;
+  checkpointArchiveId: string | null;
+  checkpointSha256: string | null;
+  /** Consumers with a live lease (they bound the reclaim floor). */
+  liveConsumers: number;
+  /** Registered consumers in total (live + expired). */
+  totalConsumers: number;
+}
+
+export interface CheckpointInfo {
+  revision: number;
+  archiveId: string;
+  sha256: string;
+  createdAt: number;
+}
+
+export interface ConsumerStatus {
+  consumerId: string;
+  ackedRevision: number;
+  leaseExpiresAt: number | null;
+  leaseLive: boolean;
+}
+
+export interface StorageStats {
+  sessionId: string;
+  firstRevision: number;
+  lastRevision: number;
+  /** Revision entries currently stored (lastRevision - firstRevision + 1). */
+  storedRevisions: number;
+  checkpoints: CheckpointInfo[];
+  consumers: ConsumerStatus[];
+}
+
 export interface RevisionEntry {
   revision: number;
   change: ChangeRecord;

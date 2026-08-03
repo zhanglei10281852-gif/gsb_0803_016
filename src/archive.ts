@@ -58,6 +58,17 @@ export interface ArchiveHeader {
   archiveId: string;
   sessionId: string;
   lastRevision: number;
+  /** Smallest revision present in the archive (1 for uncompacted sessions). */
+  firstRevision: number;
+}
+
+export interface ArchiveCheckpoint {
+  /** Revision the checkpoint archive covers (its lastRevision). */
+  revision: number;
+  archiveId: string;
+  sha256: string;
+  /** The full nested archive text. */
+  raw: string;
 }
 
 export interface ParsedArchive {
@@ -67,6 +78,7 @@ export interface ParsedArchive {
   revisions: ArchiveRevisionRow[];
   corrections: ArchiveCorrectionRow[];
   cursors: ArchiveCursorRow[];
+  checkpoint: ArchiveCheckpoint | null;
   sha256: string;
   /** Normalized archive text (one record per line, trailing newline). */
   raw: string;
@@ -85,10 +97,11 @@ export function collectArchive(
   db: Database.Database,
   sessionId: string,
   now: () => number,
+  options?: { includeCheckpoint?: boolean },
 ): string[] {
   const session = db
-    .prepare('SELECT last_revision FROM sessions WHERE session_id = ?')
-    .get(sessionId) as { last_revision: number } | undefined;
+    .prepare('SELECT last_revision, first_revision FROM sessions WHERE session_id = ?')
+    .get(sessionId) as { last_revision: number; first_revision: number } | undefined;
   if (!session) throw new ValidationError(`session "${sessionId}" does not exist`);
 
   const events = db
@@ -123,6 +136,7 @@ export function collectArchive(
     sessionId,
     exportedAt: now(),
     lastRevision: session.last_revision,
+    firstRevision: session.first_revision,
     counts: {
       events: events.length,
       revisions: revisions.length,
@@ -169,6 +183,29 @@ export function collectArchive(
     lines.push(
       JSON.stringify({ type: 'cursor', consumerId: c.consumer_id, ackedRevision: c.acked_revision }),
     );
+  }
+  // Exports (not checkpoints) carry the latest verified checkpoint so the
+  // importing side can serve reset-required recovery. Nesting depth stays 1
+  // because checkpoint archives themselves never embed a checkpoint.
+  if (options?.includeCheckpoint !== false) {
+    const cp = db
+      .prepare(
+        'SELECT checkpoint_revision, archive_id, sha256, raw_json FROM checkpoints WHERE session_id = ? ORDER BY checkpoint_revision DESC LIMIT 1',
+      )
+      .get(sessionId) as
+      | { checkpoint_revision: number; archive_id: string; sha256: string; raw_json: string }
+      | undefined;
+    if (cp) {
+      lines.push(
+        JSON.stringify({
+          type: 'checkpoint',
+          revision: cp.checkpoint_revision,
+          archiveId: cp.archive_id,
+          sha256: cp.sha256,
+          archive: cp.raw_json,
+        }),
+      );
+    }
   }
   lines.push(JSON.stringify({ type: 'end', records: lines.length - 1, sha256: hashLines(lines) }));
   return lines;
@@ -243,6 +280,10 @@ export function parseArchive(lines: string[]): ParsedArchive {
   const archiveId = reqString(header, 'archiveId', 'header');
   const sessionId = reqString(header, 'sessionId', 'header');
   const lastRevision = reqInt(header, 'lastRevision', 'header');
+  const firstRevision = optIntOrNull(header, 'firstRevision', 'header') ?? 1;
+  if (firstRevision < 1 || firstRevision > lastRevision + 1) {
+    fail(`header.firstRevision ${firstRevision} is out of range for lastRevision ${lastRevision}`);
+  }
   const counts = header.counts;
   if (counts === null || typeof counts !== 'object') fail('header.counts must be an object');
 
@@ -259,6 +300,7 @@ export function parseArchive(lines: string[]): ParsedArchive {
   const revisions: ArchiveRevisionRow[] = [];
   const corrections: ArchiveCorrectionRow[] = [];
   const cursors: ArchiveCursorRow[] = [];
+  let checkpoint: ArchiveCheckpoint | null = null;
   const eventKeys = new Set<string>();
   const partialSources = new Set<string>();
 
@@ -316,6 +358,21 @@ export function parseArchive(lines: string[]): ParsedArchive {
         });
         break;
       }
+      case 'checkpoint': {
+        if (checkpoint) fail(`${ctx}: more than one checkpoint record`);
+        const revision = reqInt(rec, 'revision', ctx, 1);
+        const cpArchiveId = reqString(rec, 'archiveId', ctx);
+        const cpSha = reqString(rec, 'sha256', ctx);
+        const rawText = rec.archive;
+        if (typeof rawText !== 'string') fail(`${ctx}: checkpoint archive must be a string`);
+        const nestedLines = rawText.split('\n').filter((l, i, arr) => !(i === arr.length - 1 && l === ''));
+        const nested = parseArchive(nestedLines); // recursion is bounded: nested text is strictly smaller
+        if (nested.header.sessionId !== sessionId) fail(`${ctx}: checkpoint session mismatch`);
+        if (nested.header.lastRevision !== revision) fail(`${ctx}: checkpoint revision mismatch`);
+        if (nested.sha256 !== cpSha) fail(`${ctx}: checkpoint checksum mismatch`);
+        checkpoint = { revision, archiveId: cpArchiveId, sha256: cpSha, raw: rawText };
+        break;
+      }
       default:
         fail(`${ctx}: unknown record type "${String(rec.type)}"`);
     }
@@ -328,12 +385,15 @@ export function parseArchive(lines: string[]): ParsedArchive {
     fail('header.counts do not match the payload');
   }
 
-  // revisions must be exactly 1..lastRevision, in order
-  if (revisions.length !== lastRevision) {
-    fail(`expected ${lastRevision} revision records, found ${revisions.length}`);
+  // revisions must be exactly firstRevision..lastRevision, in order
+  const expectedRevisions = lastRevision - firstRevision + 1;
+  if (revisions.length !== expectedRevisions) {
+    fail(`expected ${expectedRevisions} revision records (${firstRevision}..${lastRevision}), found ${revisions.length}`);
   }
   revisions.forEach((r, i) => {
-    if (r.revision !== i + 1) fail(`revisions are not contiguous and ordered (record ${i + 2})`);
+    if (r.revision !== firstRevision + i) {
+      fail(`revisions are not contiguous and ordered from ${firstRevision} (record ${i + 2})`);
+    }
   });
 
   const eventByKey = new Map(events.map((e) => [pairKey(e.source_id, e.event_id), e]));
@@ -350,7 +410,8 @@ export function parseArchive(lines: string[]): ParsedArchive {
       if (!prev) fail(`correction ${c.correction_id} supersedes a missing correction`);
       if (prev.revision >= c.revision) fail(`correction ${c.correction_id} supersedes chain is not ordered`);
     }
-    if (!revisions.some((r) => r.revision === c.revision && r.change?.type === 'correction')) {
+    if (c.revision >= firstRevision &&
+        !revisions.some((r) => r.revision === c.revision && r.change?.type === 'correction')) {
       fail(`correction ${c.correction_id} has no matching revision record`);
     }
   }
@@ -394,12 +455,13 @@ export function parseArchive(lines: string[]): ParsedArchive {
   }
 
   return {
-    header: { archiveId, sessionId, lastRevision },
+    header: { archiveId, sessionId, lastRevision, firstRevision },
     headerJson: lines[0],
     events,
     revisions,
     corrections,
     cursors,
+    checkpoint,
     sha256,
     raw,
   };

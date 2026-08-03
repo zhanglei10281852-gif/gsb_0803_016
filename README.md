@@ -112,6 +112,38 @@ const r = await store2.importArchiveFromFile('/handoff/session-42.ndjson');
 - **幂等**：同一 archiveId + 校验和重复导入返回 `duplicate`，不产生任何变化；同会话的不同归档以 `ConflictError` 拒绝（不合并）。
 - **前向兼容**：header 带 version，高于当前版本的归档被拒绝；未知可选字段被容忍，且原始归档字节完整保存在 `imports` 表中供审计与日后回放。
 
+## 长会话压缩：消费者租约 + 检查点
+
+持续数月的长会话不能让修订日志无限增长。`compact` 回收历史，但只回收同时满足两个条件的数据：**仍在租期内的最慢消费者 cursor 之前**、且**已被可验证的检查点归档覆盖**（检查点生成后立即用与导入端完全相同的完整性 + 语义校验验证，才允许删除，全部在单事务内）：
+
+```ts
+// 消费者注册/续租（心跳）；只有活租约能挡住压缩
+store.registerConsumer('qc-worker-1', 'session-42', { ttlMs: 60_000 });
+
+const stats = store.compact('session-42');
+// stats: reclaimedRevisions, bytesReclaimed, firstRevision, lastRevision,
+//        checkpointRevision/ArchiveId/Sha256, liveConsumers, totalConsumers
+const st = store.storageStats('session-42'); // storedRevisions/checkpoints/consumers 可观察
+
+// 租约过期的消费者再次续读 → 显式失败，绝不静默跳过
+try {
+  store.poll('flaky-worker', 'session-42', 100);
+} catch (e) {
+  if (e instanceof ResetRequiredError) {
+    // e.firstAvailableRevision / e.checkpointRevision
+    for await (const line of store.exportCheckpoint('session-42')) rebuild(line);
+    store.resetConsumerToCheckpoint('flaky-worker', 'session-42'); // 之后 poll 正常续读
+  }
+}
+```
+
+要点：
+
+- 回收单位只是修订日志条目；事件、校正谱系、游标不动，快照不受压缩影响。
+- 压缩后导出的归档 header 带 `firstRevision`（默认 1），校验链与第三轮一致：压缩前后归档都可验证，重建快照与未压缩实现一致；归档会携带最近检查点（嵌套一层，不递归增长），导入侧同样能提供 reset 恢复。
+- 并发安全：压缩是单事务，与 ingest/ack 交错不会丢 revision（有并发压缩/写入测试覆盖）。
+- 未注册租约的消费者不阻止压缩；新消费者在已压缩会话上 poll 会先收到 `ResetRequiredError`，经检查点引导。
+
 同一数据库文件可以被多个 `TranscriptStore` 实例（同进程或不同进程）同时读写；写操作串行化在 SQLite 层完成。
 
 ## 摄入语义
@@ -157,6 +189,12 @@ const r = await store2.importArchiveFromFile('/handoff/session-42.ndjson');
 - `exportArchiveToFile(sessionId, path)`
 - `importArchive(text | AsyncIterable<string>) → ImportResult`
 - `importArchiveFromFile(path) → ImportResult`
+- `registerConsumer(consumerId, sessionId, { ttlMs }) → { expiresAt }`（租约/心跳）
+- `compact(sessionId) → CompactionStats`
+- `storageStats(sessionId) → StorageStats`
+- `latestCheckpoint(sessionId) → CheckpointInfo | null`
+- `exportCheckpoint(sessionId) → AsyncGenerator<string>`
+- `resetConsumerToCheckpoint(consumerId, sessionId) → number`
 - `close()`
 
 另导出 `ReferenceModel`（纯内存的同等语义实现），供使用方在自己的测试里做交叉校验。

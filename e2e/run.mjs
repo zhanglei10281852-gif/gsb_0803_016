@@ -1,4 +1,5 @@
 import { main as archive } from './archive.mjs';
+import { main as compaction } from './compaction.mjs';
 import { main as concurrency } from './concurrency.mjs';
 import { main as crash } from './crash.mjs';
 import { main as review } from './review.mjs';
@@ -9,6 +10,7 @@ const scenarios = [
   ['power-cut & restart', crash],
   ['human review leases & corrections', review],
   ['session archive handoff', archive],
+  ['long-session compaction', compaction],
   ['slow consumer', slowConsumer],
 ];
 
