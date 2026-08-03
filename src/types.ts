@@ -223,3 +223,37 @@ export interface CorrectionResult extends SegmentRef {
   /** True when this was a fresh apply; false when an idempotent replay. */
   applied: boolean;
 }
+
+/** Options for {@link RevisionHub.exportSession}. */
+export interface ExportOptions {
+  /**
+   * Optional shared secret. When set, the archive's integrity chain is an HMAC
+   * keyed by this secret, so only holders of the same secret can produce an
+   * archive that verifies on import. Omit for a plain (unkeyed) digest.
+   */
+  secret?: string;
+}
+
+/** Options for {@link RevisionHub.importSession}. */
+export interface ImportOptions {
+  /** Must match the secret used at export time when the archive is keyed. */
+  secret?: string;
+}
+
+/** Outcome of importing a session archive. */
+export interface ImportResult {
+  sessionId: string;
+  /** Archive content digest (idempotency key). */
+  digest: string;
+  /** Archive format version that was imported. */
+  format: number;
+  /** Number of body records applied. */
+  recordCount: number;
+  /** Head revision after import. */
+  headRevision: number;
+  /**
+   * True when this call actually wrote the session; false when the identical
+   * archive had already been imported (idempotent no-op).
+   */
+  imported: boolean;
+}

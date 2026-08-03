@@ -11,7 +11,11 @@ export type HubErrorCode =
   /** No active lease matched the (leaseId, actor) presented at submit time. */
   | "NO_LEASE"
   /** The segment moved past the lease's baseRevision before the correction landed. */
-  | "STALE_BASE";
+  | "STALE_BASE"
+  /** An archive failed integrity/version/format checks (reordered, truncated, tampered). */
+  | "ARCHIVE_INTEGRITY"
+  /** A different archive was imported for a session that already has content. */
+  | "ARCHIVE_CONFLICT";
 
 export class HubError extends Error {
   readonly code: HubErrorCode;
@@ -80,5 +84,30 @@ export class StaleBaseError extends HubError {
   constructor(message: string, details?: Record<string, unknown>) {
     super("STALE_BASE", message, details);
     this.name = "StaleBaseError";
+  }
+}
+
+/**
+ * Thrown when an archive fails to verify: unknown/older format version, a
+ * broken hash chain (reordered or tampered records), or a missing/short trailer
+ * (truncated). Raised before any state becomes visible, so the import rolls
+ * back and leaves no partially-imported session.
+ */
+export class ArchiveIntegrityError extends HubError {
+  constructor(message: string, details?: Record<string, unknown>) {
+    super("ARCHIVE_INTEGRITY", message, details);
+    this.name = "ArchiveIntegrityError";
+  }
+}
+
+/**
+ * Thrown when a *different* archive is imported into a session that already
+ * holds content. Re-importing the identical archive is idempotent and does not
+ * raise; only a genuine divergence is a conflict.
+ */
+export class ArchiveConflictError extends HubError {
+  constructor(message: string, details?: Record<string, unknown>) {
+    super("ARCHIVE_CONFLICT", message, details);
+    this.name = "ArchiveConflictError";
   }
 }

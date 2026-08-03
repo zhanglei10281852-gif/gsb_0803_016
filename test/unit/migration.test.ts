@@ -79,9 +79,9 @@ test("v1 store migrates to v2: existing rows default to recognition origin", () 
       assert.equal(res.applied, true);
       assert.equal(hub.getSnapshot("s").segments[0]!.origin, "correction");
 
-      // Schema version is now 2.
+      // Schema version is now current (>= 3).
       const v = hub.database.prepare("SELECT value FROM meta WHERE key='schema_version'").get() as { value: string };
-      assert.equal(v.value, "2");
+      assert.ok(Number(v.value) >= 3, `schema version should be >= 3, got ${v.value}`);
     } finally {
       hub.close();
     }

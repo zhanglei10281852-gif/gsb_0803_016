@@ -21,12 +21,15 @@ export type DB = Database.Database;
  *  - `leases`      : time-boxed, single-winner correction leases per segment.
  *  - `sessions`    : per-session head revision counter (revision allocator).
  *  - `consumers`   : durable per-consumer read cursors.
+ *  - `imported_archives` : idempotency ledger of imported archive digests.
+ *  - `archive_ext` : forward-compat store of unknown optional fields seen in an
+ *                    imported archive, re-emitted verbatim on re-export.
  *
  * Every write path touches these tables inside a single IMMEDIATE transaction,
  * so a crash can never leave a revision without its segment update, or a
  * cursor advanced past data that was rolled back.
  */
-const SCHEMA_VERSION = 2;
+const SCHEMA_VERSION = 3;
 
 const SCHEMA_SQL = `
 CREATE TABLE IF NOT EXISTS meta (
@@ -135,6 +138,24 @@ CREATE TABLE IF NOT EXISTS consumers (
   updated_at   INTEGER NOT NULL,
   PRIMARY KEY (session_id, consumer_id)
 );
+
+-- Idempotency ledger: which archive (by content digest) populated a session.
+CREATE TABLE IF NOT EXISTS imported_archives (
+  session_id  TEXT PRIMARY KEY,
+  digest      TEXT NOT NULL,
+  format      INTEGER NOT NULL,
+  imported_at INTEGER NOT NULL
+);
+
+-- Forward-compat: unknown optional fields carried by imported archive records,
+-- keyed by record identity so they can be re-emitted verbatim on export.
+CREATE TABLE IF NOT EXISTS archive_ext (
+  session_id  TEXT NOT NULL,
+  record_type TEXT NOT NULL,
+  record_key  TEXT NOT NULL,
+  ext_json    TEXT NOT NULL,
+  PRIMARY KEY (session_id, record_type, record_key)
+);
 `;
 
 export function openDb(opts: RevisionHubOptions): DB {
@@ -175,8 +196,9 @@ function columnsOf(db: DB, table: string): Set<string> {
 /**
  * Forward-only migrations. v1 stores predate the correction/lease feature, so
  * we add the provenance columns to `segments`/`revisions` in place (existing
- * rows default to origin='recognition'); the `corrections`/`leases` tables were
- * already created by SCHEMA_SQL above.
+ * rows default to origin='recognition'). v2→v3 only adds new tables
+ * (`imported_archives`, `archive_ext`), which SCHEMA_SQL already created above,
+ * so there is nothing extra to do for that step.
  */
 function migrate(db: DB, from: number): void {
   const run = db.transaction(() => {
@@ -196,6 +218,7 @@ function migrate(db: DB, from: number): void {
       if (!revCols.has("supersedes_revision"))
         db.exec("ALTER TABLE revisions ADD COLUMN supersedes_revision INTEGER");
     }
+    // from < 3: tables added by SCHEMA_SQL; no column migration required.
   });
   run();
 }

@@ -148,6 +148,46 @@ Guarantees:
 - **Corrections are authoritative:** once a segment is corrected, later
   recognition events are `superseded` (extends the final-no-rollback rule).
 
+### Compliance handoff: session archives
+
+To move a whole session into an isolated environment, export it to a
+self-contained, versioned, tamper-evident archive (newline-delimited JSON) and
+import it into an empty store. The archive carries raw events, resolved
+segments, the full revision history, the **complete correction lineage**
+(`actor`, `baseRevision`, `reason`, `supersedes`), leases, and consumer cursors.
+
+```ts
+// Export side — streaming, memory-bounded (generator over SQLite cursors).
+for (const line of hub.exportSession("call-42")) writeToFile(line + "\n");
+// or, as one string:
+const archive = hub.exportSessionToString("call-42");
+// Optionally key the integrity chain with a shared secret (HMAC):
+const keyed = hub.exportSessionToString("call-42", { secret: process.env.HANDOFF_KEY });
+
+// Import side — into an empty DB. Streamed input (any chunking) is accepted.
+const res = isolatedHub.importSession(archive); // or importSession(chunkIterable)
+// res.imported === true on first import; false (no-op) on identical re-import.
+```
+
+After importing into an empty DB, the **snapshot, revision history, and
+resumable cursor positions are equivalent** to the export side — a consumer
+resumes exactly where it left off.
+
+Integrity guarantees (all fail *before any state is visible* — the import is one
+transaction and rolls back on any failure, leaving no half-imported session):
+
+- **Versioned:** the header carries a `format` version; unsupported versions are
+  rejected. Unknown *optional* fields on any record are preserved and re-emitted
+  on the next export, leaving room for later versions.
+- **Tamper-evident:** a trailer pins the body record `count`, a `content` digest
+  (idempotency key, header-time-independent), and an order-sensitive `chain`
+  digest over every line. Reordering, mutation, or truncation → the digests or
+  count mismatch → `ArchiveIntegrityError`. With `{ secret }`, the digests are
+  HMACs, so only a holder of the secret can produce a verifying archive.
+- **Idempotent:** re-importing the identical archive is a no-op
+  (`imported: false`). A *different* archive for a session that already has
+  content → `ArchiveConflictError` (it never silently overwrites).
+
 ## Data model
 
 - A **session** contains many **sources**; each source emits events for
@@ -195,13 +235,17 @@ Guarantees:
 - Human review: `acquireLease(req)` → `Lease`, `submitCorrection(req)` →
   `CorrectionResult`, `getLease(sessionId, sourceId, segmentId)`,
   `releaseLease(leaseId, actor)`
+- Handoff: `exportSession(sessionId, opts?)` → `IterableIterator<string>`,
+  `exportSessionToString(sessionId, opts?)` → `string`,
+  `importSession(source, opts?)` → `ImportResult` (`source` is a string or an
+  `Iterable<string>` of chunks; `opts` is `{ secret? }`)
 - Errors (all extend `HubError` with a `.code`): `ConflictError`,
   `ValidationError`, `LeaseConflictError`, `LeaseExpiredError`, `NoLeaseError`,
-  `StaleBaseError`
+  `StaleBaseError`, `ArchiveIntegrityError`, `ArchiveConflictError`
 
-Existing v1 stores are migrated in place on open (provenance columns added,
-defaulting to `origin="recognition"`); the previously documented API is
-unchanged and remains source-compatible.
+Existing older stores are migrated in place on open (v1→v2 adds correction
+provenance columns; v2→v3 adds the archive ledger tables); the previously
+documented API is unchanged and remains source-compatible.
 
 See `src/types.ts` for full type definitions.
 
@@ -213,7 +257,10 @@ All tests run **offline**.
   rules, revision monotonicity, determinism across many shuffled/duplicated
   orderings, consumer cursor semantics (including a no-loss/no-dup fuzz), the
   full correction/lease flow (single-winner, TTL expiry, stale base, no-rollback,
-  idempotent re-submit, supersedes lineage), and a v1→v2 migration test.
+  idempotent re-submit, supersedes lineage), schema migration, and the archive
+  flow (round-trip equivalence, idempotent re-import, conflict, deterministic
+  digest, reorder/truncate/tamper/version rejection, HMAC secret, streamed
+  chunking, forward-compat unknown fields).
 - `npm run e2e` — simulations:
   - **Multi-instance concurrency:** 5 child processes write the same logical
     stream (with 25% overlapping deliveries) to one SQLite file; the resolved
@@ -231,6 +278,11 @@ All tests run **offline**.
   - **Correction power loss:** a reviewer process is `SIGKILL`-ed mid-correction;
     the store stays consistent (no segment flipped without its lineage +
     stream revision) and the review completes on resume.
+  - **Archive fault injection:** an import child process is `SIGKILL`-ed before
+    it can commit — the target DB shows no session at all — then a clean
+    re-import restores state equivalent to the source and a second import
+    no-ops. A separate case races two importer processes on one file and asserts
+    exactly one writes while the other is an idempotent no-op.
 
 ## License
 
