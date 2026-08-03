@@ -1,5 +1,9 @@
 import Database from 'better-sqlite3';
 import { randomUUID } from 'node:crypto';
+import { createReadStream, createWriteStream } from 'node:fs';
+import { once } from 'node:events';
+import readline from 'node:readline';
+import { collectArchive, parseArchive, type ParsedArchive } from './archive';
 import { buildSnapshot, correctionKey, eventHash, type EventRow } from './core';
 import { ConflictError, ReviewConflictError, ValidationError } from './errors';
 import { MIGRATIONS, SCHEMA } from './schema';
@@ -8,6 +12,7 @@ import type {
   AsrEvent,
   ChangeRecord,
   CorrectionInfo,
+  ImportResult,
   IngestResult,
   LeaseInfo,
   PollResult,
@@ -130,9 +135,11 @@ export class TranscriptStore {
   }
 
   private migrate(): void {
-    const cols = (this.db.pragma('table_info(events)') as { name: string }[]).map((c) => c.name);
-    if (!cols.includes('applied_revision')) {
-      for (const sql of MIGRATIONS) this.db.exec(sql);
+    const hasColumn = (table: string, column: string) =>
+      (this.db.pragma(`table_info(${table})`) as { name: string }[]).some((c) => c.name === column);
+    if (!hasColumn('events', 'applied_revision')) this.db.exec(MIGRATIONS.events_applied_revision);
+    if (!hasColumn('corrections', 'base_revision')) {
+      this.db.exec(MIGRATIONS.corrections_base_revision);
     }
   }
 
@@ -305,6 +312,65 @@ export class TranscriptStore {
       baseRevision: row.base_revision,
       expiresAt: row.expires_at,
     };
+  }
+
+  // --------------------------- session archive ---------------------------
+
+  /**
+   * Stream a self-contained archive of one session as NDJSON lines (each
+   * terminated by '\n'). State is captured in one consistent read; the
+   * archive carries events, the full revision stream, corrections (with
+   * actor/baseRevision/reason/supersedes), consumer cursors, and an
+   * integrity checksum.
+   */
+  async *exportArchive(sessionId: string): AsyncGenerator<string> {
+    validateId('sessionId', sessionId);
+    const capture = this.db.transaction(() => collectArchive(this.db, sessionId, this.nowFn));
+    const lines = capture() as string[];
+    for (const line of lines) yield line + '\n';
+  }
+
+  /** Export a session archive to a file, streaming line by line. */
+  async exportArchiveToFile(sessionId: string, path: string): Promise<void> {
+    const ws = createWriteStream(path, { encoding: 'utf8' });
+    try {
+      for await (const line of this.exportArchive(sessionId)) {
+        if (!ws.write(line)) await once(ws, 'drain');
+      }
+    } finally {
+      ws.end();
+    }
+    await once(ws, 'finish');
+  }
+
+  /**
+   * Import a session archive (full text or a stream of lines) into this
+   * database. The archive is fully validated (structure, checksum,
+   * cross-references) and committed in a single transaction: a reordered,
+   * truncated or tampered archive fails before any state becomes visible.
+   * Re-importing the same archive is an idempotent no-op; importing a
+   * different archive for an existing session is a ConflictError.
+   */
+  async importArchive(source: string | AsyncIterable<string> | Iterable<string>): Promise<ImportResult> {
+    const lines: string[] = [];
+    if (typeof source === 'string') {
+      for (const l of source.split('\n')) lines.push(l.replace(/\r$/, ''));
+    } else {
+      // A failing/short stream rejects here and nothing is committed.
+      for await (const chunk of source) lines.push(String(chunk).replace(/[\r\n]+$/, ''));
+    }
+    while (lines.length > 0 && lines[lines.length - 1] === '') lines.pop();
+    const parsed = parseArchive(lines);
+    return this.db.transaction(() => this.commitImport(parsed)).immediate();
+  }
+
+  /** Import a session archive from a file, read line by line. */
+  async importArchiveFromFile(path: string): Promise<ImportResult> {
+    const rl = readline.createInterface({
+      input: createReadStream(path, { encoding: 'utf8' }),
+      crlfDelay: Infinity,
+    });
+    return this.importArchive(rl);
   }
 
   close(): void {
@@ -560,8 +626,8 @@ export class TranscriptStore {
     const correctionId = randomUUID();
     this.db
       .prepare(
-        `INSERT INTO corrections (session_id, correction_id, target_source_id, target_event_id, text, actor, reason, supersedes, revision, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        `INSERT INTO corrections (session_id, correction_id, target_source_id, target_event_id, text, actor, reason, supersedes, base_revision, revision, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         sessionId,
@@ -572,6 +638,7 @@ export class TranscriptStore {
         options.actor,
         options.reason,
         previous?.correctionId ?? null,
+        options.baseRevision,
         revision,
         now,
       );
@@ -589,11 +656,69 @@ export class TranscriptStore {
       actor: options.actor,
       reason: options.reason,
       supersedes: previous?.correctionId ?? null,
+      baseRevision: options.baseRevision,
     };
     this.db
       .prepare('INSERT INTO revisions (session_id, revision, change_json, created_at) VALUES (?, ?, ?, ?)')
       .run(sessionId, revision, JSON.stringify(change), Date.now());
 
     return { status: 'applied', revision, correctionId };
+  }
+
+  // ------------------------- archive internals -------------------------
+
+  private commitImport(parsed: ParsedArchive): ImportResult {
+    const { archiveId, sessionId, lastRevision } = parsed.header;
+    const existing = this.db
+      .prepare('SELECT last_revision FROM sessions WHERE session_id = ?')
+      .get(sessionId) as SessionRow | undefined;
+    if (existing) {
+      const dup = this.db
+        .prepare('SELECT sha256 FROM imports WHERE session_id = ? AND archive_id = ?')
+        .get(sessionId, archiveId) as { sha256: string } | undefined;
+      if (dup && dup.sha256 === parsed.sha256) {
+        return { status: 'duplicate', sessionId, archiveId, lastRevision: existing.last_revision };
+      }
+      throw new ConflictError(
+        `session "${sessionId}" already exists and was not imported from archive ${archiveId}`,
+      );
+    }
+
+    this.db
+      .prepare('INSERT INTO sessions (session_id, last_revision) VALUES (?, ?)')
+      .run(sessionId, lastRevision);
+    const insertEvent = this.db.prepare(
+      `INSERT INTO events (session_id, source_id, event_id, source_seq, kind, text, start_ms, content_hash, applied_revision)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    );
+    for (const e of parsed.events) {
+      insertEvent.run(sessionId, e.source_id, e.event_id, e.source_seq, e.kind, e.text, e.start_ms, e.content_hash, e.applied_revision);
+    }
+    const insertRevision = this.db.prepare(
+      'INSERT INTO revisions (session_id, revision, change_json, created_at) VALUES (?, ?, ?, ?)',
+    );
+    for (const r of parsed.revisions) {
+      insertRevision.run(sessionId, r.revision, JSON.stringify(r.change), this.nowFn());
+    }
+    const insertCorrection = this.db.prepare(
+      `INSERT INTO corrections (session_id, correction_id, target_source_id, target_event_id, text, actor, reason, supersedes, base_revision, revision, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    );
+    for (const c of parsed.corrections) {
+      insertCorrection.run(sessionId, c.correction_id, c.target_source_id, c.target_event_id, c.text, c.actor, c.reason, c.supersedes, c.base_revision, c.revision, this.nowFn());
+    }
+    const insertCursor = this.db.prepare(
+      'INSERT INTO cursors (consumer_id, session_id, acked_revision) VALUES (?, ?, ?)',
+    );
+    for (const c of parsed.cursors) {
+      insertCursor.run(c.consumer_id, sessionId, c.acked_revision);
+    }
+    this.db
+      .prepare(
+        'INSERT INTO imports (session_id, archive_id, sha256, header_json, raw_json, imported_at) VALUES (?, ?, ?, ?, ?, ?)',
+      )
+      .run(sessionId, archiveId, parsed.sha256, parsed.headerJson, parsed.raw, this.nowFn());
+
+    return { status: 'imported', sessionId, archiveId, lastRevision };
   }
 }

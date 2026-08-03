@@ -89,6 +89,8 @@ export interface ChangeRecord {
   actor?: string;
   reason?: string;
   supersedes?: string | null;
+  /** Base revision the correction was submitted against (null for pre-archive rows). */
+  baseRevision?: number | null;
 }
 
 /** Reference to a stored segment, used as the target of leases/corrections. */
@@ -124,6 +126,14 @@ export interface SubmitCorrectionResult {
   status: 'applied';
   revision: number;
   correctionId: string;
+}
+
+export interface ImportResult {
+  /** 'imported' on first import; 'duplicate' when this archive was already imported. */
+  status: 'imported' | 'duplicate';
+  sessionId: string;
+  archiveId: string;
+  lastRevision: number;
 }
 
 export interface RevisionEntry {

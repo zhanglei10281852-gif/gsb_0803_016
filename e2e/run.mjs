@@ -1,3 +1,4 @@
+import { main as archive } from './archive.mjs';
 import { main as concurrency } from './concurrency.mjs';
 import { main as crash } from './crash.mjs';
 import { main as review } from './review.mjs';
@@ -7,6 +8,7 @@ const scenarios = [
   ['multi-instance concurrency', concurrency],
   ['power-cut & restart', crash],
   ['human review leases & corrections', review],
+  ['session archive handoff', archive],
   ['slow consumer', slowConsumer],
 ];
 

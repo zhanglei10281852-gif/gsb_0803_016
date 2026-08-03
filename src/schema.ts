@@ -56,18 +56,31 @@ CREATE TABLE IF NOT EXISTS corrections (
   actor            TEXT NOT NULL,
   reason           TEXT NOT NULL,
   supersedes       TEXT,
+  base_revision    INTEGER,
   revision         INTEGER NOT NULL,
   created_at       INTEGER NOT NULL,
   PRIMARY KEY (session_id, correction_id)
 );
 CREATE INDEX IF NOT EXISTS idx_corrections_target
   ON corrections (session_id, target_source_id, target_event_id, revision);
+
+-- Archives imported into this database (idempotent re-import + pristine copy).
+CREATE TABLE IF NOT EXISTS imports (
+  session_id  TEXT NOT NULL,
+  archive_id  TEXT NOT NULL,
+  sha256      TEXT NOT NULL,
+  header_json TEXT NOT NULL,
+  raw_json    TEXT NOT NULL,
+  imported_at INTEGER NOT NULL,
+  PRIMARY KEY (session_id, archive_id)
+);
 `;
 
 /**
- * v0.1 databases lack events.applied_revision; add it in place. It records
- * the stream revision that applied the event (used for stale-base checks).
+ * In-place migrations for databases created by earlier versions. Each entry
+ * is applied only when its column is missing (guarded in TranscriptStore).
  */
-export const MIGRATIONS = [
-  `ALTER TABLE events ADD COLUMN applied_revision INTEGER`,
-];
+export const MIGRATIONS = {
+  events_applied_revision: `ALTER TABLE events ADD COLUMN applied_revision INTEGER`,
+  corrections_base_revision: `ALTER TABLE corrections ADD COLUMN base_revision INTEGER`,
+};

@@ -89,6 +89,29 @@ try {
 - 校正在单个事务里消费租约 + 追加 `type: 'correction'` 的 revision，现有消费者用 `poll`/`ack` 原样续读；快照中 `segment.text` 为生效文本，`originalText` 与 `correction` 保留原文和校正元数据。
 - 租约与校正都在 SQLite 中持久化，承受进程重启与多实例并发。
 
+## 会话归档：合规交接
+
+`exportArchive` 把完整会话（事件、全部修订历史、含 actor/baseRevision/reason/supersedes 的校正记录、消费者游标）导出为自包含的 NDJSON 归档，可流式生成与读取，用于交接到隔离环境：
+
+```ts
+// 导出（逐行流式）
+await store.exportArchiveToFile('session-42', '/handoff/session-42.ndjson');
+for await (const line of store.exportArchive('session-42')) send(line);
+
+// 导入（隔离环境，空库）
+const r = await store2.importArchiveFromFile('/handoff/session-42.ndjson');
+// 或 importArchive(fullText | AsyncIterable<string>)
+// r.status: 'imported'；之后 snapshot/poll/cursor 与导出端等价，消费者原样续读
+```
+
+格式（v1，`ARCHIVE_FORMAT` / `ARCHIVE_VERSION` 导出常量）：
+
+- 首行 header（format、version、archiveId、sessionId、lastRevision、counts），随后 event / revision / correction / cursor 记录，末行 end（记录数 + 对前面所有原始行字节的 SHA-256）。
+- **完整性**：重排、截断、篡改会因校验和失败；即使攻击者重算校验和，语义校验（revision 连续有序、change 与事件/校正记录逐一对应、supersedes 谱系合法、游标不越界）也会拒绝。
+- **原子性**：导入先整体验证再单事务提交；中途失败（含进程断电）不留半导入会话。
+- **幂等**：同一 archiveId + 校验和重复导入返回 `duplicate`，不产生任何变化；同会话的不同归档以 `ConflictError` 拒绝（不合并）。
+- **前向兼容**：header 带 version，高于当前版本的归档被拒绝；未知可选字段被容忍，且原始归档字节完整保存在 `imports` 表中供审计与日后回放。
+
 同一数据库文件可以被多个 `TranscriptStore` 实例（同进程或不同进程）同时读写；写操作串行化在 SQLite 层完成。
 
 ## 摄入语义
@@ -130,6 +153,10 @@ try {
 - `submitCorrection(sessionId, target, { leaseId, baseRevision, text, actor, reason }) → { status, revision, correctionId }`
 - `releaseLease(sessionId, target, leaseId) → boolean`
 - `lease(sessionId, target) → { leaseId, actor, baseRevision, expiresAt } | null`
+- `exportArchive(sessionId) → AsyncGenerator<string>`（NDJSON 行）
+- `exportArchiveToFile(sessionId, path)`
+- `importArchive(text | AsyncIterable<string>) → ImportResult`
+- `importArchiveFromFile(path) → ImportResult`
 - `close()`
 
 另导出 `ReferenceModel`（纯内存的同等语义实现），供使用方在自己的测试里做交叉校验。
