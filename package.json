@@ -1,0 +1,26 @@
+{
+  "name": "asr-transcript-store",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Durable multi-source ASR transcript assembly: idempotent ingest, queryable snapshots, and a per-session revision stream with consumer cursors, backed by local SQLite.",
+  "type": "commonjs",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "vitest run",
+    "e2e": "npm run build && node e2e/run.mjs"
+  },
+  "dependencies": {
+    "better-sqlite3": "^12.2.0"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.13",
+    "@types/node": "^20.19.0",
+    "typescript": "^5.8.3",
+    "vitest": "^2.1.9"
+  }
+}
