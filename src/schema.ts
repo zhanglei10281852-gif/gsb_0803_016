@@ -1,6 +1,6 @@
 import type Database from "better-sqlite3";
 
-export const SCHEMA_VERSION = 2;
+export const SCHEMA_VERSION = 3;
 
 export const SCHEMA_SQL = `
 CREATE TABLE IF NOT EXISTS events (
@@ -87,6 +87,22 @@ CREATE INDEX IF NOT EXISTS idx_corrections_segment
 
 CREATE INDEX IF NOT EXISTS idx_corrections_supersedes
   ON corrections(session_id, supersedes);
+
+CREATE TABLE IF NOT EXISTS archive_extras (
+  session_id TEXT NOT NULL,
+  record_table TEXT NOT NULL,
+  record_key TEXT NOT NULL,
+  extras TEXT NOT NULL,
+  PRIMARY KEY(session_id, record_table, record_key)
+);
+
+CREATE TABLE IF NOT EXISTS archive_unknown_records (
+  session_id TEXT NOT NULL,
+  seq INTEGER NOT NULL,
+  record_type TEXT NOT NULL,
+  payload TEXT NOT NULL,
+  PRIMARY KEY(session_id, seq)
+);
 `;
 
 function hasColumn(

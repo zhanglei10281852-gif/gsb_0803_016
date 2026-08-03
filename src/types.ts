@@ -1,3 +1,9 @@
+import type { Readable } from "node:stream";
+import type {
+  ArchiveImportResult,
+  SessionArchiveStream,
+} from "./archive-types";
+
 export interface RecognitionEventInput {
   eventId: string;
   sourceId: string;
@@ -138,7 +144,7 @@ export interface CorrectionRecord {
 export interface RecognitionStore {
   ingest(
     sessionId: string,
-    event: RecognitionEventInput | readonly RecognitionEventInput[]
+    event: RecognitionEventInput | readonly RecognitionEventInput[],
   ): IngestOutcome | IngestOutcome[];
   getSnapshot(sessionId: string): Snapshot;
   getSnapshotAt(sessionId: string, revision: number): Snapshot;
@@ -146,36 +152,46 @@ export interface RecognitionStore {
   fetchChanges(
     sessionId: string,
     consumerId: string,
-    limit?: number
+    limit?: number,
   ): RevisionRecord[];
   acknowledge(sessionId: string, consumerId: string, revision: number): number;
   getCursor(sessionId: string, consumerId: string): number;
   createConsumer(sessionId: string, consumerId: string): RevisionConsumer;
 
-  claimLease(
-    sessionId: string,
-    input: ClaimLeaseInput
-  ): ClaimLeaseOutcome;
+  claimLease(sessionId: string, input: ClaimLeaseInput): ClaimLeaseOutcome;
   releaseLease(sessionId: string, leaseId: string, actor: string): void;
   getLease(sessionId: string, leaseId: string): ReviewLease | undefined;
   getActiveLease(
     sessionId: string,
     sourceId: string,
-    sourceSeq: number
+    sourceSeq: number,
   ): ReviewLease | undefined;
   submitCorrection(
     sessionId: string,
-    input: SubmitCorrectionInput
+    input: SubmitCorrectionInput,
   ): SubmitCorrectionOutcome;
   getCorrection(
     sessionId: string,
-    correctionId: string
+    correctionId: string,
   ): CorrectionRecord | undefined;
   getCorrectionLineage(
     sessionId: string,
     sourceId: string,
-    sourceSeq: number
+    sourceSeq: number,
   ): CorrectionRecord[];
+
+  exportArchive(sessionId: string): SessionArchiveStream;
+  writeArchive(sessionId: string, outputPath: string): Promise<void>;
+  importArchive(
+    sessionId: string,
+    stream: Readable,
+    options?: { injectFailureAfterRecords?: number },
+  ): Promise<ArchiveImportResult>;
+  importArchiveFile(
+    sessionId: string,
+    inputPath: string,
+    options?: { injectFailureAfterRecords?: number },
+  ): Promise<ArchiveImportResult>;
 
   close(): void;
 }

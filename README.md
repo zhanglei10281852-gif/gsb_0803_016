@@ -95,6 +95,36 @@ Additional review methods:
 - Corrections are additive: recognition rows are never overwritten, and the full correction lineage is queryable. The effective snapshot always shows the latest correction per segment; `originalText` preserves the ASR output.
 - Retention is not automatic. Revisions remain available until the application chooses to archive or delete them, which keeps slow consumers from losing unread changes.
 
+## Session archives for isolated handover
+
+Compliance teams can export a complete, self-contained session archive as a stream of newline-delimited JSON and import it into an isolated environment. The archive carries all events, every revision (with full snapshot), corrections including actor / reason / baseRevision / supersedes lineage, review leases, and consumer cursors.
+
+```ts
+// Streamable export (async iterable of strings)
+for await (const chunk of store.exportArchive(sessionId)) {
+  isolatedUpload.write(chunk);
+}
+
+// Or write directly to a file
+await store.writeArchive(sessionId, "./handoff/session.asr-archive");
+
+// Import on the isolated side
+const result = await isolatedStore.importArchive(sessionId, readable);
+```
+
+Archive format (version 1):
+
+- One JSON header line with magic `ASR-SESSION-ARCHIVE`, `archiveVersion`, `libraryVersion`, `sessionId`, `recordCount`, and a SHA-256 `dataHash` of the canonical data lines.
+- One JSON line per record, in canonical sort order. Known record types are `event`, `revision`, `correction`, `lease`, and `cursor`. Unknown record types and unknown optional fields on known records are preserved verbatim so later versions can round-trip data written by newer code.
+- One JSON footer line with the same `dataHash` and `recordCount`.
+
+Guarantees:
+
+- Import is fully verified (structure, contiguous revisions, referential integrity of correction lineage and leases, header/footer counts, and the SHA-256 over all canonical data lines) before any data is written. If the archive was truncated, reordered, or tampered with, the import rejects with `ArchiveIntegrityError` and the destination session remains empty — no half-imported state is visible.
+- The entire import applies in a single SQLite transaction, so a crash or injected failure rolls back completely.
+- Re-importing the identical archive into a non-empty but identical target is idempotent: existing rows are skipped and reported as duplicates; conflicting content rejects with `ArchiveImportConflictError` without mutating the database.
+- After import, `getSnapshot`, `getRevision`, `getCorrectionLineage`, `getLease`, and `getCursor` return values equivalent to the source. Existing consumers resume from their archived cursor positions; the new correction revisions are delivered through the same revision/cursor stream.
+
 ## Commands
 
 ```sh
@@ -104,4 +134,4 @@ npm test
 npm run e2e
 ```
 
-Tests run entirely offline with local temporary SQLite databases. Unit tests cover idempotency, conflicts, stale partials, final immutability, deterministic snapshots, revisions, consumer cursors, lease competition, lease expiry, stale-base-revision conflicts, and correction lineage. End-to-end tests spawn multiple processes, force-kill a writer mid-ingest, reopen the database, and run a slow page-limited consumer.
+Tests run entirely offline with local temporary SQLite databases. Unit and integration tests cover idempotency, conflicts, stale partials, final immutability, deterministic snapshots, revisions, consumer cursors, lease competition, lease expiry, stale-base-revision conflicts, correction lineage, archive round-trip equivalence, idempotent re-import, tamper/truncation/reorder rejection, fault-injection rollback, and forward-compatible preservation of unknown fields and record types. End-to-end tests spawn multiple processes, force-kill a writer mid-ingest, reopen the database, and run a slow page-limited consumer.

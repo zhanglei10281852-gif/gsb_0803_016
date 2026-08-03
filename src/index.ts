@@ -12,6 +12,31 @@ export {
   type EventConflictReason,
   type ReviewConflictReason,
 } from "./errors";
+export {
+  ArchiveImportConflictError,
+  ArchiveIntegrityError,
+  exportSessionArchive,
+  importSessionArchive,
+  importSessionArchiveFile,
+  writeSessionArchive,
+  type ImportSessionArchiveOptions,
+} from "./archive";
+export {
+  ARCHIVE_FORMAT_VERSION,
+  ARCHIVE_MAGIC,
+  type ArchiveCorrectionRecord,
+  type ArchiveCursorRecord,
+  type ArchiveDataRecord,
+  type ArchiveEventRecord,
+  type ArchiveFooter,
+  type ArchiveHeader,
+  type ArchiveImportResult,
+  type ArchiveLeaseRecord,
+  type ArchiveRecordType,
+  type ArchiveRevisionRecord,
+  type ArchiveUnknownData,
+  type SessionArchiveStream,
+} from "./archive-types";
 export type {
   ChangeType,
   ClaimLeaseInput,

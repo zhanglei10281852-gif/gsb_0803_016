@@ -1,11 +1,23 @@
 import Database from "better-sqlite3";
 import { randomUUID } from "node:crypto";
+import type { Readable } from "node:stream";
 import { initializeSchema } from "./schema";
 import {
   buildSnapshot,
   createSnapshotStatements,
   type SnapshotStatements,
 } from "./snapshot";
+import {
+  exportSessionArchive,
+  importSessionArchive,
+  importSessionArchiveFile,
+  writeSessionArchive,
+  type ImportSessionArchiveOptions,
+} from "./archive";
+import type {
+  ArchiveImportResult,
+  SessionArchiveStream,
+} from "./archive-types";
 import {
   EventConflictError,
   InvalidEventError,
@@ -1124,6 +1136,36 @@ export class RecognitionStore implements RecognitionStoreLike {
     assertNonEmptyString(sessionId, "sessionId");
     assertNonEmptyString(consumerId, "consumerId");
     return new SQLiteRevisionConsumer(this, sessionId, consumerId);
+  }
+
+  exportArchive(sessionId: string): SessionArchiveStream {
+    assertNonEmptyString(sessionId, "sessionId");
+    return exportSessionArchive(this.db, sessionId, this.clock);
+  }
+
+  async writeArchive(sessionId: string, outputPath: string): Promise<void> {
+    assertNonEmptyString(sessionId, "sessionId");
+    assertNonEmptyString(outputPath, "outputPath");
+    await writeSessionArchive(this.db, sessionId, outputPath, this.clock);
+  }
+
+  async importArchive(
+    sessionId: string,
+    stream: Readable,
+    options: ImportSessionArchiveOptions = {},
+  ): Promise<ArchiveImportResult> {
+    assertNonEmptyString(sessionId, "sessionId");
+    return importSessionArchive(this.db, sessionId, stream, options);
+  }
+
+  async importArchiveFile(
+    sessionId: string,
+    inputPath: string,
+    options: ImportSessionArchiveOptions = {},
+  ): Promise<ArchiveImportResult> {
+    assertNonEmptyString(sessionId, "sessionId");
+    assertNonEmptyString(inputPath, "inputPath");
+    return importSessionArchiveFile(this.db, sessionId, inputPath, options);
   }
 
   close(): void {
