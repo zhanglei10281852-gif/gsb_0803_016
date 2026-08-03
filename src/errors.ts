@@ -15,7 +15,9 @@ export type HubErrorCode =
   /** An archive failed integrity/version/format checks (reordered, truncated, tampered). */
   | "ARCHIVE_INTEGRITY"
   /** A different archive was imported for a session that already has content. */
-  | "ARCHIVE_CONFLICT";
+  | "ARCHIVE_CONFLICT"
+  /** A consumer's cursor fell below the compaction watermark; it must reset. */
+  | "RESET_REQUIRED";
 
 export class HubError extends Error {
   readonly code: HubErrorCode;
@@ -109,5 +111,19 @@ export class ArchiveConflictError extends HubError {
   constructor(message: string, details?: Record<string, unknown>) {
     super("ARCHIVE_CONFLICT", message, details);
     this.name = "ArchiveConflictError";
+  }
+}
+
+/**
+ * Thrown when a consumer tries to read after its cursor has fallen behind the
+ * session's compaction watermark: the revisions it would need next have been
+ * recycled. The consumer must explicitly reset (typically to the latest
+ * checkpoint) rather than silently skipping data. The `details` carry the
+ * `compactedUpto` watermark and the recommended `resumeFrom` revision.
+ */
+export class ResetRequiredError extends HubError {
+  constructor(message: string, details?: Record<string, unknown>) {
+    super("RESET_REQUIRED", message, details);
+    this.name = "ResetRequiredError";
   }
 }

@@ -188,6 +188,55 @@ transaction and rolls back on any failure, leaving no half-imported session):
   (`imported: false`). A *different* archive for a session that already has
   content → `ArchiveConflictError` (it never silently overwrites).
 
+### Long sessions: log compaction
+
+For sessions that run for months, the revision log can't grow forever. Compaction
+recycles old revision-log rows under two guards that must *both* be satisfied:
+
+1. **Consumer read-leases.** A consumer takes a durable, time-boxed lease
+   (`acquireConsumerLease` / `renewConsumerLease`). Compaction never reclaims at
+   or below the slowest *live-lease* cursor, so an active-but-slow consumer never
+   loses unread data.
+2. **Verifiable checkpoints.** Only revisions covered by a checkpoint may be
+   recycled. A checkpoint is a self-contained, integrity-chained archive of the
+   session (reusing the round-3 chain), stored inline and **re-verified before it
+   is allowed to gate reclamation** — a tampered/incomplete checkpoint can never
+   authorise data loss.
+
+The reclaim watermark is `min(slowest live-lease cursor, latest verifiable
+checkpoint)`. Compaction only ever touches the `revisions` log — never
+`segments`/`events`/`corrections` — so **the queryable snapshot is identical
+before and after**, and archives exported pre/post compaction both verify and
+rebuild the same snapshot.
+
+```ts
+// Consumers protect their progress with a renewable lease.
+hub.acquireConsumerLease({ sessionId: "call-42", consumerId: "qc", ttlMs: 60_000 });
+
+// Periodically checkpoint + compact (e.g. from a timer). Returns observable stats.
+const stats = hub.compact("call-42", { secret: process.env.HANDOFF_KEY });
+// stats: { reclaimed, compactedUpto, headRevision, checkpointRevision,
+//          slowestLiveCursor, checkpointCreated, remaining }
+hub.getCompactionState("call-42"); // retained, latestCheckpoint, expiredConsumers, ...
+```
+
+**Expired consumers never skip silently.** If a consumer's lease lapses and
+compaction advances past its cursor, its next `pull` throws `ResetRequiredError`
+(with `compactedUpto` and a `resumeFrom` checkpoint revision) instead of quietly
+losing revisions. The consumer recovers explicitly:
+
+```ts
+try {
+  hub.pull("call-42", "stale-consumer");
+} catch (e) {
+  if (e instanceof ResetRequiredError) {
+    const rec = hub.recoverConsumer("call-42", "stale-consumer"); // verifies the checkpoint
+    render(rec.snapshot);        // snapshot equivalent to the uncompacted state
+    // subsequent pulls resume strictly after rec.checkpointRevision — no gaps
+  }
+}
+```
+
 ## Data model
 
 - A **session** contains many **sources**; each source emits events for
@@ -239,12 +288,19 @@ transaction and rolls back on any failure, leaving no half-imported session):
   `exportSessionToString(sessionId, opts?)` → `string`,
   `importSession(source, opts?)` → `ImportResult` (`source` is a string or an
   `Iterable<string>` of chunks; `opts` is `{ secret? }`)
+- Compaction: `acquireConsumerLease(req)` / `renewConsumerLease(...)` →
+  `ConsumerLease`, `getConsumerLease(...)`, `createCheckpoint(sessionId, opts?)` →
+  `Checkpoint`, `listCheckpoints(sessionId)`, `compact(sessionId, opts?)` →
+  `CompactionStats`, `getCompactionState(sessionId)` → `CompactionState`,
+  `recoverConsumer(sessionId, consumerId, opts?)` → `RecoveryResult`
 - Errors (all extend `HubError` with a `.code`): `ConflictError`,
   `ValidationError`, `LeaseConflictError`, `LeaseExpiredError`, `NoLeaseError`,
-  `StaleBaseError`, `ArchiveIntegrityError`, `ArchiveConflictError`
+  `StaleBaseError`, `ArchiveIntegrityError`, `ArchiveConflictError`,
+  `ResetRequiredError`
 
 Existing older stores are migrated in place on open (v1→v2 adds correction
-provenance columns; v2→v3 adds the archive ledger tables); the previously
+provenance columns; v2→v3 adds the archive ledger tables; v3→v4 adds the
+compaction watermark, consumer lease, and checkpoints); the previously
 documented API is unchanged and remains source-compatible.
 
 See `src/types.ts` for full type definitions.
@@ -257,10 +313,13 @@ All tests run **offline**.
   rules, revision monotonicity, determinism across many shuffled/duplicated
   orderings, consumer cursor semantics (including a no-loss/no-dup fuzz), the
   full correction/lease flow (single-winner, TTL expiry, stale base, no-rollback,
-  idempotent re-submit, supersedes lineage), schema migration, and the archive
+  idempotent re-submit, supersedes lineage), schema migration, the archive
   flow (round-trip equivalence, idempotent re-import, conflict, deterministic
   digest, reorder/truncate/tamper/version rejection, HMAC secret, streamed
-  chunking, forward-compat unknown fields).
+  chunking, forward-compat unknown fields), and compaction (lease+checkpoint
+  gating, live-lease protection, expired-consumer reset, checkpoint recovery
+  equivalence, snapshot/archive equivalence pre-post compaction, tampered-
+  checkpoint refusal, and stats/observability).
 - `npm run e2e` — simulations:
   - **Multi-instance concurrency:** 5 child processes write the same logical
     stream (with 25% overlapping deliveries) to one SQLite file; the resolved
@@ -275,6 +334,10 @@ All tests run **offline**.
     on shared segments; exactly one correction wins per base revision, the
     stream stays dense, every segment resolves to a correction winner, and raw
     events remain untouched.
+  - **Concurrent compaction:** two compaction processes run `compact()` while a
+    writer streams and a leased consumer reads — the reader loses nothing and
+    hits no reset, the retained log stays dense above the watermark, and a
+    separate case drives an expired consumer through reset → checkpoint recovery.
   - **Correction power loss:** a reviewer process is `SIGKILL`-ed mid-correction;
     the store stays consistent (no segment flipped without its lineage +
     stream revision) and the review completes on resume.

@@ -41,12 +41,13 @@ export type ArchiveRecordType =
   | "correction"
   | "lease"
   | "consumer"
+  | "checkpoint"
   | "trailer";
 
 /** Recognised (non-ext) keys for each body record type. */
 export const KNOWN_FIELDS: Record<string, ReadonlySet<string>> = {
   header: new Set(["type", "format", "sessionId", "createdAt", "keyed"]),
-  session: new Set(["type", "sessionId", "headRevision"]),
+  session: new Set(["type", "sessionId", "headRevision", "compactedUpto"]),
   event: new Set([
     "type", "sessionId", "sourceId", "eventId", "segmentId", "sourceSeq",
     "kind", "text", "startMs", "endMs", "contentHash", "receivedAt",
@@ -69,7 +70,8 @@ export const KNOWN_FIELDS: Record<string, ReadonlySet<string>> = {
     "type", "sessionId", "sourceId", "segmentId", "leaseId", "actor",
     "baseRevision", "acquiredAt", "expiresAt", "released",
   ]),
-  consumer: new Set(["type", "sessionId", "consumerId", "cursor", "updatedAt"]),
+  consumer: new Set(["type", "sessionId", "consumerId", "cursor", "updatedAt", "leaseExpiresAt"]),
+  checkpoint: new Set(["type", "sessionId", "revision", "digest", "keyed", "archive", "createdAt"]),
   trailer: new Set(["type", "count", "content", "chain"]),
 };
 

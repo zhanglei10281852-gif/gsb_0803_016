@@ -29,7 +29,7 @@ export type DB = Database.Database;
  * so a crash can never leave a revision without its segment update, or a
  * cursor advanced past data that was rolled back.
  */
-const SCHEMA_VERSION = 3;
+const SCHEMA_VERSION = 4;
 
 const SCHEMA_SQL = `
 CREATE TABLE IF NOT EXISTS meta (
@@ -39,7 +39,8 @@ CREATE TABLE IF NOT EXISTS meta (
 
 CREATE TABLE IF NOT EXISTS sessions (
   session_id    TEXT PRIMARY KEY,
-  head_revision INTEGER NOT NULL DEFAULT 0
+  head_revision INTEGER NOT NULL DEFAULT 0,
+  compacted_upto INTEGER NOT NULL DEFAULT 0
 );
 
 -- Append-only record of every distinct event we accepted or rejected-by-content.
@@ -132,12 +133,27 @@ CREATE INDEX IF NOT EXISTS idx_leases_id ON leases (session_id, lease_id);
 
 -- Durable read cursors.
 CREATE TABLE IF NOT EXISTS consumers (
-  session_id   TEXT NOT NULL,
-  consumer_id  TEXT NOT NULL,
-  cursor       INTEGER NOT NULL DEFAULT 0,
-  updated_at   INTEGER NOT NULL,
+  session_id       TEXT NOT NULL,
+  consumer_id      TEXT NOT NULL,
+  cursor           INTEGER NOT NULL DEFAULT 0,
+  updated_at       INTEGER NOT NULL,
+  lease_expires_at INTEGER NOT NULL DEFAULT 0,
   PRIMARY KEY (session_id, consumer_id)
 );
+
+-- Verifiable compaction checkpoints: a self-contained archive of the session
+-- as of the checkpoint revision, plus its integrity digest, so a reset consumer
+-- can be rebuilt to an exact snapshot and compaction can prove coverage.
+CREATE TABLE IF NOT EXISTS checkpoints (
+  session_id  TEXT NOT NULL,
+  revision    INTEGER NOT NULL,
+  digest      TEXT NOT NULL,
+  keyed       INTEGER NOT NULL DEFAULT 0,
+  archive     TEXT NOT NULL,
+  created_at  INTEGER NOT NULL,
+  PRIMARY KEY (session_id, revision)
+);
+CREATE INDEX IF NOT EXISTS idx_checkpoints_session ON checkpoints (session_id, revision);
 
 -- Idempotency ledger: which archive (by content digest) populated a session.
 CREATE TABLE IF NOT EXISTS imported_archives (
@@ -219,6 +235,17 @@ function migrate(db: DB, from: number): void {
         db.exec("ALTER TABLE revisions ADD COLUMN supersedes_revision INTEGER");
     }
     // from < 3: tables added by SCHEMA_SQL; no column migration required.
+    if (from < 4) {
+      // v3→v4 adds compaction: watermark on sessions, lease on consumers, and
+      // the `checkpoints` table (created by SCHEMA_SQL). Existing rows default
+      // to compacted_upto=0 / lease_expires_at=0 (no lease, nothing recycled).
+      const sessCols = columnsOf(db, "sessions");
+      if (!sessCols.has("compacted_upto"))
+        db.exec("ALTER TABLE sessions ADD COLUMN compacted_upto INTEGER NOT NULL DEFAULT 0");
+      const conCols = columnsOf(db, "consumers");
+      if (!conCols.has("lease_expires_at"))
+        db.exec("ALTER TABLE consumers ADD COLUMN lease_expires_at INTEGER NOT NULL DEFAULT 0");
+    }
   });
   run();
 }

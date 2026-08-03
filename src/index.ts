@@ -15,12 +15,20 @@ export {
   StaleBaseError,
   ArchiveIntegrityError,
   ArchiveConflictError,
+  ResetRequiredError,
 } from "./errors";
 export type { HubErrorCode } from "./errors";
 export type {
   AcquireLeaseRequest,
   ApplyOutcome,
   ApplyResult,
+  Checkpoint,
+  CheckpointOptions,
+  CompactionState,
+  CompactionStats,
+  CompactOptions,
+  ConsumerLease,
+  ConsumerLeaseRequest,
   CorrectionResult,
   EventKind,
   ExportOptions,
@@ -28,6 +36,7 @@ export type {
   ImportResult,
   Lease,
   PullOptions,
+  RecoveryResult,
   RevisionHubOptions,
   RevisionOrigin,
   RevisionRecord,

@@ -11,6 +11,7 @@ import {
   StaleBaseError,
   ArchiveIntegrityError,
   ArchiveConflictError,
+  ResetRequiredError,
 } from "./errors";
 import {
   ARCHIVE_FORMAT,
@@ -24,12 +25,20 @@ import type {
   AcquireLeaseRequest,
   ApplyResult,
   ApplyOutcome,
+  Checkpoint,
+  CheckpointOptions,
+  CompactionState,
+  CompactionStats,
+  CompactOptions,
+  ConsumerLease,
+  ConsumerLeaseRequest,
   CorrectionResult,
   ExportOptions,
   ImportOptions,
   ImportResult,
   Lease,
   PullOptions,
+  RecoveryResult,
   RevisionHubOptions,
   RevisionRecord,
   SegmentState,
@@ -471,6 +480,23 @@ export class RevisionHub {
       throw new ValidationError("limit must be a positive integer");
     }
     const after = opts.afterRevision ?? this.getCursor(sessionId, consumerId, true);
+
+    // Compaction guard: if the next revision this read needs (after+1) has been
+    // recycled, we must not silently skip it. Signal an explicit reset instead.
+    const compactedUpto = this.compactedUpto(sessionId);
+    if (after < compactedUpto) {
+      throw new ResetRequiredError(
+        "consumer cursor is behind the compaction watermark; reset required",
+        {
+          sessionId,
+          consumerId,
+          cursor: after,
+          compactedUpto,
+          resumeFrom: this.latestCheckpointRevision(sessionId),
+        },
+      );
+    }
+
     const rows = this.db
       .prepare(
         `SELECT session_id, revision, source_id, segment_id, kind, text, start_ms,
@@ -890,6 +916,357 @@ export class RevisionHub {
   }
 
   // ---------------------------------------------------------------------------
+  // Long-session compaction: consumer leases, checkpoints, and reclamation
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Acquire (or renew) a durable read-lease for a consumer. While the lease is
+   * live, compaction will not recycle revisions at or below this consumer's
+   * cursor, so a slow-but-active consumer never loses unread data. Renewing
+   * simply extends the expiry. Auto-creates the consumer at cursor 0.
+   */
+  acquireConsumerLease(req: ConsumerLeaseRequest): ConsumerLease {
+    if (!req.consumerId) throw new ValidationError("consumerId is required");
+    if (!Number.isInteger(req.ttlMs) || req.ttlMs <= 0) {
+      throw new ValidationError("ttlMs must be a positive integer");
+    }
+    const runner = this.db.transaction((): ConsumerLease => {
+      const now = this.now();
+      const expiresAt = now + req.ttlMs;
+      this.db
+        .prepare(
+          `INSERT INTO consumers (session_id, consumer_id, cursor, updated_at, lease_expires_at)
+             VALUES (?,?,0,?,?)
+           ON CONFLICT(session_id, consumer_id) DO UPDATE SET
+             lease_expires_at = excluded.lease_expires_at,
+             updated_at = excluded.updated_at`,
+        )
+        .run(req.sessionId, req.consumerId, now, expiresAt);
+      return this.getConsumerLease(req.sessionId, req.consumerId)!;
+    });
+    return runner.immediate();
+  }
+
+  /** Renew an existing consumer lease; equivalent to acquiring again. */
+  renewConsumerLease(sessionId: string, consumerId: string, ttlMs: number): ConsumerLease {
+    return this.acquireConsumerLease({ sessionId, consumerId, ttlMs });
+  }
+
+  /** Read a consumer's lease/cursor state, or null if the consumer is unknown. */
+  getConsumerLease(sessionId: string, consumerId: string): ConsumerLease | null {
+    const row = this.db
+      .prepare(
+        "SELECT cursor, lease_expires_at FROM consumers WHERE session_id=? AND consumer_id=?",
+      )
+      .get(sessionId, consumerId) as { cursor: number; lease_expires_at: number } | undefined;
+    if (!row) return null;
+    return {
+      sessionId,
+      consumerId,
+      cursor: row.cursor,
+      leaseExpiresAt: row.lease_expires_at,
+    };
+  }
+
+  /**
+   * Create a verifiable checkpoint at the session's current head. A checkpoint
+   * is a self-contained, integrity-chained archive of the whole session state
+   * (via {@link exportSession}, minus nested checkpoints), stored inline so a
+   * reset consumer can be rebuilt to an exact snapshot and so compaction can
+   * prove that everything below the checkpoint revision is durably captured.
+   * Idempotent per head revision.
+   */
+  createCheckpoint(sessionId: string, opts: CheckpointOptions = {}): Checkpoint {
+    const secret = opts.secret;
+    const runner = this.db.transaction((): Checkpoint => {
+      const head = this.headRevision(sessionId);
+      const existing = this.db
+        .prepare("SELECT revision, digest, keyed, created_at FROM checkpoints WHERE session_id=? AND revision=?")
+        .get(sessionId, head) as
+        | { revision: number; digest: string; keyed: number; created_at: number }
+        | undefined;
+      if (existing) {
+        return {
+          sessionId,
+          revision: existing.revision,
+          digest: existing.digest,
+          keyed: existing.keyed === 1,
+          createdAt: existing.created_at,
+        };
+      }
+
+      // Build the checkpoint archive from the current state (no nested checkpoints).
+      let archive = "";
+      for (const line of this.generateArchive(sessionId, secret, false)) archive += line + "\n";
+      // Verify what we just produced (defence in depth) and capture its digest.
+      const verified = verifyArchive(archive, secret);
+      const now = this.now();
+      this.db
+        .prepare(
+          `INSERT INTO checkpoints (session_id, revision, digest, keyed, archive, created_at)
+             VALUES (?,?,?,?,?,?)`,
+        )
+        .run(sessionId, head, verified.contentDigest, secret !== undefined ? 1 : 0, archive, now);
+      return {
+        sessionId,
+        revision: head,
+        digest: verified.contentDigest,
+        keyed: secret !== undefined,
+        createdAt: now,
+      };
+    });
+    return runner.immediate();
+  }
+
+  /**
+   * Reclaim revision-log rows that are (a) at or below the slowest LIVE-lease
+   * consumer cursor and (b) covered by a verifiable checkpoint. The reclaim
+   * watermark is `min(slowest live cursor, latest verifiable checkpoint)`; if
+   * there are no live-lease consumers the checkpoint alone bounds reclamation.
+   *
+   * The checkpoint archive is re-verified against the integrity chain before it
+   * is allowed to gate reclamation, so a tampered/incomplete checkpoint can
+   * never authorise data loss. Never touches `segments`/`events`/`corrections`,
+   * so the queryable snapshot is unchanged by compaction.
+   */
+  compact(sessionId: string, opts: CompactOptions = {}): CompactionStats {
+    const secret = opts.secret;
+    const wantCheckpoint = opts.checkpoint !== false;
+
+    // Optionally create a fresh checkpoint first (its own transaction).
+    let checkpointCreated = false;
+    if (wantCheckpoint && this.headRevision(sessionId) > this.latestCheckpointRevision(sessionId)) {
+      const before = this.latestCheckpointRevision(sessionId);
+      const cp = this.createCheckpoint(sessionId, { secret });
+      checkpointCreated = cp.revision > before;
+    }
+
+    const runner = this.db.transaction((): CompactionStats => {
+      const now = this.now();
+      const head = this.headRevision(sessionId);
+      const priorWatermark = this.compactedUpto(sessionId);
+
+      // (a) slowest LIVE-lease cursor (expired leases do not protect anything).
+      const liveRow = this.db
+        .prepare(
+          `SELECT MIN(cursor) AS m, COUNT(*) AS c FROM consumers
+             WHERE session_id=? AND lease_expires_at > ?`,
+        )
+        .get(sessionId, now) as { m: number | null; c: number };
+      const slowestLiveCursor = liveRow.c > 0 ? (liveRow.m ?? 0) : null;
+
+      // (b) latest checkpoint that actually verifies right now.
+      const checkpointRevision = this.latestVerifiableCheckpoint(sessionId, secret);
+
+      // Reclaim watermark: bounded by both gates, and never below prior mark.
+      let watermark = checkpointRevision;
+      if (slowestLiveCursor !== null) watermark = Math.min(watermark, slowestLiveCursor);
+      if (watermark < priorWatermark) watermark = priorWatermark;
+
+      let reclaimed = 0;
+      if (watermark > priorWatermark) {
+        const res = this.db
+          .prepare("DELETE FROM revisions WHERE session_id=? AND revision <= ?")
+          .run(sessionId, watermark);
+        reclaimed = res.changes;
+        this.db
+          .prepare("UPDATE sessions SET compacted_upto=? WHERE session_id=?")
+          .run(watermark, sessionId);
+      }
+
+      const remaining = (
+        this.db
+          .prepare("SELECT COUNT(*) AS c FROM revisions WHERE session_id=?")
+          .get(sessionId) as { c: number }
+      ).c;
+
+      return {
+        sessionId,
+        reclaimed,
+        compactedUpto: Math.max(watermark, priorWatermark),
+        headRevision: head,
+        checkpointRevision,
+        slowestLiveCursor,
+        checkpointCreated,
+        remaining,
+      };
+    });
+    return runner.immediate();
+  }
+
+  /**
+   * Reset a consumer that received a {@link ResetRequiredError} back to the
+   * latest checkpoint and hand back the rebuilt snapshot as of that checkpoint.
+   * The consumer resumes reading strictly after the checkpoint revision — no
+   * data is silently skipped, and the reconstructed snapshot is equivalent to
+   * the uncompacted implementation. Verifies the checkpoint archive first.
+   */
+  recoverConsumer(sessionId: string, consumerId: string, opts: ImportOptions = {}): RecoveryResult {
+    if (!consumerId) throw new ValidationError("consumerId is required");
+    const runner = this.db.transaction((): RecoveryResult => {
+      const cp = this.db
+        .prepare(
+          `SELECT revision, archive, keyed FROM checkpoints
+             WHERE session_id=? ORDER BY revision DESC LIMIT 1`,
+        )
+        .get(sessionId) as { revision: number; archive: string; keyed: number } | undefined;
+      if (!cp) {
+        throw new ValidationError("no checkpoint available to recover from", { sessionId });
+      }
+      // Re-verify the checkpoint archive before trusting it for recovery.
+      verifyArchive(cp.archive, cp.keyed === 1 ? opts.secret : undefined);
+      const snapshot = this.snapshotFromCheckpointArchive(cp.archive);
+
+      // Move the consumer's durable cursor to the checkpoint revision so the
+      // next pull resumes exactly after it (never below the watermark).
+      const now = this.now();
+      this.db
+        .prepare(
+          `INSERT INTO consumers (session_id, consumer_id, cursor, updated_at, lease_expires_at)
+             VALUES (?,?,?,?,0)
+           ON CONFLICT(session_id, consumer_id) DO UPDATE SET
+             cursor = MAX(cursor, excluded.cursor),
+             updated_at = excluded.updated_at`,
+        )
+        .run(sessionId, consumerId, cp.revision, now);
+
+      return { sessionId, consumerId, checkpointRevision: cp.revision, snapshot };
+    });
+    return runner.immediate();
+  }
+
+  /** Observable compaction state for a session (for metrics/dashboards). */
+  getCompactionState(sessionId: string): CompactionState {
+    const now = this.now();
+    const head = this.headRevision(sessionId);
+    const compactedUpto = this.compactedUpto(sessionId);
+    const retained = (
+      this.db
+        .prepare("SELECT COUNT(*) AS c FROM revisions WHERE session_id=?")
+        .get(sessionId) as { c: number }
+    ).c;
+    const cpRow = this.db
+      .prepare("SELECT COUNT(*) AS c, COALESCE(MAX(revision),0) AS m FROM checkpoints WHERE session_id=?")
+      .get(sessionId) as { c: number; m: number };
+    const liveRow = this.db
+      .prepare(
+        "SELECT MIN(cursor) AS m, COUNT(*) AS c FROM consumers WHERE session_id=? AND lease_expires_at > ?",
+      )
+      .get(sessionId, now) as { m: number | null; c: number };
+    const expired = this.db
+      .prepare(
+        `SELECT consumer_id FROM consumers
+           WHERE session_id=? AND lease_expires_at > 0 AND lease_expires_at <= ?
+           ORDER BY consumer_id`,
+      )
+      .all(sessionId, now) as Array<{ consumer_id: string }>;
+    return {
+      sessionId,
+      headRevision: head,
+      compactedUpto,
+      retained,
+      latestCheckpoint: cpRow.m,
+      checkpointCount: cpRow.c,
+      slowestLiveCursor: liveRow.c > 0 ? (liveRow.m ?? 0) : null,
+      expiredConsumers: expired.map((e) => e.consumer_id),
+    };
+  }
+
+  /** List checkpoints for a session, oldest first. */
+  listCheckpoints(sessionId: string): Checkpoint[] {
+    const rows = this.db
+      .prepare(
+        "SELECT revision, digest, keyed, created_at FROM checkpoints WHERE session_id=? ORDER BY revision",
+      )
+      .all(sessionId) as Array<{ revision: number; digest: string; keyed: number; created_at: number }>;
+    return rows.map((r) => ({
+      sessionId,
+      revision: r.revision,
+      digest: r.digest,
+      keyed: r.keyed === 1,
+      createdAt: r.created_at,
+    }));
+  }
+
+  /** Current compaction watermark for a session (0 if none). */
+  private compactedUpto(sessionId: string): number {
+    const row = this.db
+      .prepare("SELECT compacted_upto AS c FROM sessions WHERE session_id=?")
+      .get(sessionId) as { c: number } | undefined;
+    return row?.c ?? 0;
+  }
+
+  /** Latest checkpoint revision (0 if none), without verification. */
+  private latestCheckpointRevision(sessionId: string): number {
+    const row = this.db
+      .prepare("SELECT COALESCE(MAX(revision),0) AS m FROM checkpoints WHERE session_id=?")
+      .get(sessionId) as { m: number };
+    return row.m;
+  }
+
+  /**
+   * Latest checkpoint revision whose stored archive still verifies against the
+   * integrity chain (0 if none verify). A checkpoint that fails verification is
+   * never allowed to authorise reclamation.
+   */
+  private latestVerifiableCheckpoint(sessionId: string, secret?: string): number {
+    const rows = this.db
+      .prepare(
+        "SELECT revision, archive, keyed FROM checkpoints WHERE session_id=? ORDER BY revision DESC",
+      )
+      .all(sessionId) as Array<{ revision: number; archive: string; keyed: number }>;
+    for (const r of rows) {
+      try {
+        verifyArchive(r.archive, r.keyed === 1 ? secret : undefined);
+        return r.revision;
+      } catch {
+        // Skip a checkpoint that no longer verifies; try an older one.
+      }
+    }
+    return 0;
+  }
+
+  /** Rebuild a Snapshot from a checkpoint archive's segment records. */
+  private snapshotFromCheckpointArchive(archive: string): Snapshot {
+    const { sessionId, bodyRecords } = verifyArchive(archive);
+    let headRevision = 0;
+    const segs: SegmentState[] = [];
+    for (const { type, known: k } of bodyRecords) {
+      if (type === "session") headRevision = Number(k.headRevision);
+      else if (type === "segment") {
+        segs.push({
+          sourceId: String(k.sourceId),
+          segmentId: String(k.segmentId),
+          kind: k.kind as SegmentState["kind"],
+          text: String(k.text),
+          startMs: k.startMs === null || k.startMs === undefined ? null : Number(k.startMs),
+          endMs: k.endMs === null || k.endMs === undefined ? null : Number(k.endMs),
+          sourceSeq: Number(k.sourceSeq),
+          eventId: String(k.eventId),
+          revision: Number(k.revision),
+          origin: k.origin as SegmentState["origin"],
+          actor: k.actor === null || k.actor === undefined ? null : String(k.actor),
+        });
+      }
+    }
+    // Order deterministically to match getSnapshot (startMs, sourceId, segmentId).
+    segs.sort((a, b) => {
+      const an = a.startMs === null ? 1 : 0;
+      const bn = b.startMs === null ? 1 : 0;
+      if (an !== bn) return an - bn;
+      if ((a.startMs ?? 0) !== (b.startMs ?? 0)) return (a.startMs ?? 0) - (b.startMs ?? 0);
+      if (a.sourceId !== b.sourceId) return a.sourceId < b.sourceId ? -1 : 1;
+      return a.segmentId < b.segmentId ? -1 : a.segmentId > b.segmentId ? 1 : 0;
+    });
+    return {
+      sessionId,
+      headRevision,
+      segments: segs,
+      summary: this.summarize(segs),
+    };
+  }
+
+  // ---------------------------------------------------------------------------
   // Compliance handoff: self-contained session archives
   // ---------------------------------------------------------------------------
 
@@ -906,7 +1283,19 @@ export class RevisionHub {
    * reorder/mutation/truncation is detected on import.
    */
   *exportSession(sessionId: string, opts: ExportOptions = {}): IterableIterator<string> {
-    const secret = opts.secret;
+    yield* this.generateArchive(sessionId, opts.secret, true);
+  }
+
+  /**
+   * Core archive generator. `includeCheckpoints` is false when producing a
+   * checkpoint's own archive (a checkpoint captures the session state, not the
+   * checkpoints themselves — that would be self-referential).
+   */
+  private *generateArchive(
+    sessionId: string,
+    secret: string | undefined,
+    includeCheckpoints: boolean,
+  ): IterableIterator<string> {
     const chain = new Chain(secret);
     const content = new Hasher(secret);
     const extMap = this.loadExt(sessionId);
@@ -920,7 +1309,11 @@ export class RevisionHub {
 
     // 1) Header — folded into the chain but NOT the content digest, so the
     //    volatile createdAt never affects the idempotency key.
-    const headRevision = this.headRevision(sessionId);
+    const sess = this.db
+      .prepare("SELECT head_revision, compacted_upto FROM sessions WHERE session_id=?")
+      .get(sessionId) as { head_revision: number; compacted_upto: number } | undefined;
+    const headRevision = sess?.head_revision ?? 0;
+    const compactedUpto = sess?.compacted_upto ?? 0;
     const headerLine = emit({
       type: "header",
       format: ARCHIVE_FORMAT,
@@ -940,8 +1333,8 @@ export class RevisionHub {
       return line;
     };
 
-    // 2) session record.
-    yield body({ type: "session", sessionId, headRevision }, "");
+    // 2) session record (carries the compaction watermark).
+    yield body({ type: "session", sessionId, headRevision, compactedUpto }, "");
 
     // 3) events (raw recognition, preserved verbatim).
     for (const r of this.iterate(
@@ -1080,9 +1473,9 @@ export class RevisionHub {
       );
     }
 
-    // 8) consumer cursors (resumable read positions).
+    // 8) consumer cursors (resumable read positions + read-lease expiry).
     for (const r of this.iterate(
-      `SELECT consumer_id, cursor, updated_at
+      `SELECT consumer_id, cursor, updated_at, lease_expires_at
          FROM consumers WHERE session_id=? ORDER BY consumer_id`,
       sessionId,
     )) {
@@ -1093,12 +1486,36 @@ export class RevisionHub {
           consumerId: r.consumer_id,
           cursor: r.cursor,
           updatedAt: r.updated_at,
+          leaseExpiresAt: r.lease_expires_at,
         },
         r.consumer_id as string,
       );
     }
 
-    // 9) trailer — the tamper-evidence anchor. Not folded into itself.
+    // 9) checkpoints (verifiable recovery points), unless we are generating a
+    //    checkpoint's own archive.
+    if (includeCheckpoints) {
+      for (const r of this.iterate(
+        `SELECT revision, digest, keyed, archive, created_at
+           FROM checkpoints WHERE session_id=? ORDER BY revision`,
+        sessionId,
+      )) {
+        yield body(
+          {
+            type: "checkpoint",
+            sessionId,
+            revision: r.revision,
+            digest: r.digest,
+            keyed: r.keyed,
+            archive: r.archive,
+            createdAt: r.created_at,
+          },
+          String(r.revision),
+        );
+      }
+    }
+
+    // 10) trailer — the tamper-evidence anchor. Not folded into itself.
     yield canonicalStringify({
       type: "trailer",
       count,
@@ -1132,84 +1549,13 @@ export class RevisionHub {
    */
   importSession(source: string | Iterable<string>, opts: ImportOptions = {}): ImportResult {
     const secret = opts.secret;
-    const lines = collectLines(source);
 
     const runner = this.db.transaction((): ImportResult => {
-      const chain = new Chain(secret);
-      const content = new Hasher(secret);
-
-      if (lines.length === 0) {
-        throw new ArchiveIntegrityError("empty archive");
-      }
-
-      // --- Header ---
-      const headerLine = lines[0]!;
-      const header = parseJson(headerLine, "header");
-      if (header.type !== "header") {
-        throw new ArchiveIntegrityError("archive does not start with a header", {
-          got: header.type,
-        });
-      }
-      const format = header.format;
-      if (typeof format !== "number" || !SUPPORTED_FORMATS.has(format)) {
-        throw new ArchiveIntegrityError("unsupported archive format version", {
-          format,
-          supported: [...SUPPORTED_FORMATS],
-        });
-      }
-      const sessionId = header.sessionId;
-      if (typeof sessionId !== "string" || sessionId.length === 0) {
-        throw new ArchiveIntegrityError("header missing sessionId");
-      }
-      chain.update(headerLine);
-
-      // --- Body ---
-      // We buffer parsed body records so idempotency/conflict can be decided
-      // (which needs the content digest, known only after the whole body) before
-      // touching domain tables. Integrity is still verified line-by-line.
-      interface Parsed {
-        type: string;
-        known: Record<string, unknown>;
-        ext: Record<string, unknown>;
-      }
-      const bodyRecords: Parsed[] = [];
-      let trailer: Record<string, unknown> | null = null;
-      let count = 0;
-
-      for (let i = 1; i < lines.length; i++) {
-        const line = lines[i]!;
-        const obj = parseJson(line, "record");
-        if (obj.type === "trailer") {
-          if (i !== lines.length - 1) {
-            throw new ArchiveIntegrityError("records found after trailer", { index: i });
-          }
-          trailer = obj;
-          break;
-        }
-        chain.update(line);
-        content.update(line);
-        count += 1;
-        const { known, ext } = splitExt(obj.type as string, obj);
-        bodyRecords.push({ type: obj.type as string, known, ext });
-      }
-
-      // --- Trailer verification (truncation / reorder / tamper) ---
-      if (!trailer) {
-        throw new ArchiveIntegrityError("archive is truncated: missing trailer");
-      }
-      if (trailer.count !== count) {
-        throw new ArchiveIntegrityError("record count mismatch (truncated or tampered)", {
-          expected: trailer.count,
-          actual: count,
-        });
-      }
-      const contentDigestValue = content.digest();
-      if (trailer.content !== contentDigestValue) {
-        throw new ArchiveIntegrityError("content digest mismatch (reordered or tampered)");
-      }
-      if (trailer.chain !== chain.digest()) {
-        throw new ArchiveIntegrityError("chain digest mismatch (reordered or tampered)");
-      }
+      const { header, sessionId, format, bodyRecords, count, contentDigest } = verifyArchive(
+        source,
+        secret,
+      );
+      const contentDigestValue = contentDigest;
 
       // --- Idempotency / conflict ---
       const ledger = this.db
@@ -1304,10 +1650,12 @@ export class RevisionHub {
     const nstr = (v: unknown): string | null => (v === null || v === undefined ? null : String(v));
 
     let headRevision = 0;
+    let compactedUpto = 0;
     for (const { type, known: k } of records) {
       switch (type) {
         case "session":
           headRevision = reqNum(k.headRevision);
+          compactedUpto = k.compactedUpto === undefined ? 0 : reqNum(k.compactedUpto);
           break;
         case "event":
           this.db
@@ -1385,10 +1733,31 @@ export class RevisionHub {
         case "consumer":
           this.db
             .prepare(
-              `INSERT INTO consumers (session_id, consumer_id, cursor, updated_at)
-               VALUES (?,?,?,?)`,
+              `INSERT INTO consumers (session_id, consumer_id, cursor, updated_at, lease_expires_at)
+               VALUES (?,?,?,?,?)`,
             )
-            .run(sessionId, str(k.consumerId), reqNum(k.cursor), reqNum(k.updatedAt));
+            .run(
+              sessionId,
+              str(k.consumerId),
+              reqNum(k.cursor),
+              reqNum(k.updatedAt),
+              k.leaseExpiresAt === undefined ? 0 : reqNum(k.leaseExpiresAt),
+            );
+          break;
+        case "checkpoint":
+          this.db
+            .prepare(
+              `INSERT INTO checkpoints (session_id, revision, digest, keyed, archive, created_at)
+               VALUES (?,?,?,?,?,?)`,
+            )
+            .run(
+              sessionId,
+              reqNum(k.revision),
+              str(k.digest),
+              reqNum(k.keyed),
+              str(k.archive),
+              reqNum(k.createdAt),
+            );
           break;
         default:
           // Unknown record TYPE (not just unknown fields) is rejected: this
@@ -1397,13 +1766,15 @@ export class RevisionHub {
       }
     }
 
-    // Rebuild the session's revision allocator from the carried head.
+    // Rebuild the session's revision allocator + compaction watermark.
     this.db
       .prepare(
-        `INSERT INTO sessions (session_id, head_revision) VALUES (?, ?)
-           ON CONFLICT(session_id) DO UPDATE SET head_revision = excluded.head_revision`,
+        `INSERT INTO sessions (session_id, head_revision, compacted_upto) VALUES (?, ?, ?)
+           ON CONFLICT(session_id) DO UPDATE SET
+             head_revision = excluded.head_revision,
+             compacted_upto = excluded.compacted_upto`,
       )
-      .run(sessionId, headRevision);
+      .run(sessionId, headRevision, compactedUpto);
   }
 
   /** Compute the archive_ext record key for a record of a given type. */
@@ -1417,6 +1788,8 @@ export class RevisionHub {
       case "lease":
         return `${String(k.sourceId)}\u0000${String(k.segmentId)}`;
       case "revision":
+        return String(k.revision);
+      case "checkpoint":
         return String(k.revision);
       case "correction":
         return String(k.correctionId);
@@ -1483,4 +1856,96 @@ function parseJson(line: string, what: string): Record<string, unknown> {
     throw new ArchiveIntegrityError(`malformed ${what}: not an object`);
   }
   return obj as Record<string, unknown>;
+}
+
+/** A body record split into recognised and unknown (forward-compat) fields. */
+interface ParsedRecord {
+  type: string;
+  known: Record<string, unknown>;
+  ext: Record<string, unknown>;
+}
+
+/** The verified pieces of an archive, ready to apply. */
+interface VerifiedArchive {
+  header: Record<string, unknown>;
+  sessionId: string;
+  format: number;
+  bodyRecords: ParsedRecord[];
+  count: number;
+  contentDigest: string;
+}
+
+/**
+ * Fully verify an archive's version, hash chain, content digest, and record
+ * count. Throws {@link ArchiveIntegrityError} on any reorder / mutation /
+ * truncation / unsupported version. Pure (no DB access), so it is reused both
+ * by {@link RevisionHub.importSession} and by compaction to re-check that a
+ * stored checkpoint archive still verifies before it is allowed to gate
+ * reclamation.
+ */
+function verifyArchive(source: string | Iterable<string>, secret?: string): VerifiedArchive {
+  const lines = collectLines(source);
+  const chain = new Chain(secret);
+  const content = new Hasher(secret);
+
+  if (lines.length === 0) throw new ArchiveIntegrityError("empty archive");
+
+  const headerLine = lines[0]!;
+  const header = parseJson(headerLine, "header");
+  if (header.type !== "header") {
+    throw new ArchiveIntegrityError("archive does not start with a header", {
+      got: header.type,
+    });
+  }
+  const format = header.format;
+  if (typeof format !== "number" || !SUPPORTED_FORMATS.has(format)) {
+    throw new ArchiveIntegrityError("unsupported archive format version", {
+      format,
+      supported: [...SUPPORTED_FORMATS],
+    });
+  }
+  const sessionId = header.sessionId;
+  if (typeof sessionId !== "string" || sessionId.length === 0) {
+    throw new ArchiveIntegrityError("header missing sessionId");
+  }
+  chain.update(headerLine);
+
+  const bodyRecords: ParsedRecord[] = [];
+  let trailer: Record<string, unknown> | null = null;
+  let count = 0;
+  for (let i = 1; i < lines.length; i++) {
+    const line = lines[i]!;
+    const obj = parseJson(line, "record");
+    if (obj.type === "trailer") {
+      if (i !== lines.length - 1) {
+        throw new ArchiveIntegrityError("records found after trailer", { index: i });
+      }
+      trailer = obj;
+      break;
+    }
+    chain.update(line);
+    content.update(line);
+    count += 1;
+    const { known, ext } = splitExt(obj.type as string, obj);
+    bodyRecords.push({ type: obj.type as string, known, ext });
+  }
+
+  if (!trailer) {
+    throw new ArchiveIntegrityError("archive is truncated: missing trailer");
+  }
+  if (trailer.count !== count) {
+    throw new ArchiveIntegrityError("record count mismatch (truncated or tampered)", {
+      expected: trailer.count,
+      actual: count,
+    });
+  }
+  const contentDigestValue = content.digest();
+  if (trailer.content !== contentDigestValue) {
+    throw new ArchiveIntegrityError("content digest mismatch (reordered or tampered)");
+  }
+  if (trailer.chain !== chain.digest()) {
+    throw new ArchiveIntegrityError("chain digest mismatch (reordered or tampered)");
+  }
+
+  return { header, sessionId, format, bodyRecords, count, contentDigest: contentDigestValue };
 }

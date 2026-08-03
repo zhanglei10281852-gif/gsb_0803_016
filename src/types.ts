@@ -257,3 +257,101 @@ export interface ImportResult {
    */
   imported: boolean;
 }
+
+/** Options for {@link RevisionHub.acquireConsumerLease}. */
+export interface ConsumerLeaseRequest {
+  sessionId: string;
+  consumerId: string;
+  /** Lease lifetime in ms from acquisition. Must be a positive integer. */
+  ttlMs: number;
+}
+
+/** A durable consumer read-lease that protects unread revisions from recycling. */
+export interface ConsumerLease {
+  sessionId: string;
+  consumerId: string;
+  /** Current durable cursor. */
+  cursor: number;
+  /** Epoch ms when the lease expires (0 = no active lease). */
+  leaseExpiresAt: number;
+}
+
+/** A verifiable compaction checkpoint. */
+export interface Checkpoint {
+  sessionId: string;
+  /** Head revision captured by this checkpoint. */
+  revision: number;
+  /** Content digest of the checkpoint archive (its idempotency identity). */
+  digest: string;
+  /** True when the checkpoint archive is HMAC-keyed. */
+  keyed: boolean;
+  createdAt: number;
+}
+
+/** Options for {@link RevisionHub.createCheckpoint} / {@link RevisionHub.compact}. */
+export interface CheckpointOptions {
+  /** Optional shared secret to HMAC the checkpoint archive's integrity chain. */
+  secret?: string;
+}
+
+/** Options controlling a {@link RevisionHub.compact} pass. */
+export interface CompactOptions {
+  /**
+   * Optional secret used both to create a fresh checkpoint (when needed) and to
+   * verify the checkpoint archive that gates reclamation.
+   */
+  secret?: string;
+  /**
+   * When true (default), create a checkpoint at the current head before
+   * computing the reclaim watermark, so compaction can always make progress up
+   * to the slowest live-lease cursor. When false, only pre-existing checkpoints
+   * gate reclamation.
+   */
+  checkpoint?: boolean;
+}
+
+/** Observable statistics from a compaction pass. */
+export interface CompactionStats {
+  sessionId: string;
+  /** Revisions recycled by this pass. */
+  reclaimed: number;
+  /** Watermark: revisions <= this are now recycled (session-wide). */
+  compactedUpto: number;
+  /** Head revision at the time of the pass. */
+  headRevision: number;
+  /** Revision of the checkpoint that gated reclamation (0 if none). */
+  checkpointRevision: number;
+  /** Slowest live-lease consumer cursor that limited reclamation (null if none). */
+  slowestLiveCursor: number | null;
+  /** True when a new checkpoint was created during this pass. */
+  checkpointCreated: boolean;
+  /** Revisions remaining in the log after this pass. */
+  remaining: number;
+}
+
+/** A point-in-time view of a session's compaction state (observability). */
+export interface CompactionState {
+  sessionId: string;
+  headRevision: number;
+  compactedUpto: number;
+  /** Revisions currently retained in the log. */
+  retained: number;
+  /** Latest checkpoint revision (0 if none). */
+  latestCheckpoint: number;
+  /** Number of checkpoints retained. */
+  checkpointCount: number;
+  /** Slowest cursor among live-lease consumers (null if none). */
+  slowestLiveCursor: number | null;
+  /** Consumers whose lease has expired (candidates for reset). */
+  expiredConsumers: string[];
+}
+
+/** Result of recovering a reset consumer from the latest checkpoint. */
+export interface RecoveryResult {
+  sessionId: string;
+  consumerId: string;
+  /** The checkpoint revision the consumer was reset to. */
+  checkpointRevision: number;
+  /** The rebuilt snapshot as of the checkpoint (equivalent to uncompacted). */
+  snapshot: Snapshot;
+}
